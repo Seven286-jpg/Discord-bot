@@ -1,0 +1,913 @@
+"""
+Custom Discord Server Bot
+--------------------------
+Features:
+  1. /setup_server    - builds out categories & channels (info, donations, chats, support,
+                          female verification, staff, and a category per ticket type)
+  2. Ticket system     - /ticket-panel posts a dropdown with 5 ticket types (Ban, Female
+                          Verify, City Report, Reimburse, Higher Ups); each type gets its own
+                          category and its own transcript log channel. Tickets have Claim and
+                          Close buttons; closing saves a full transcript before deleting.
+  3. /apply            - modal application form; staff Approve/Deny in #applications grants the
+                          Whitelisted role and DMs the applicant the result
+  4. Auto-reactions/threads - any message posted in #suggestions gets 👍/👎 automatically;
+                          any message in #bug-reports automatically gets its own thread
+  5. /post_image       - post an image (with optional caption) to any channel
+  6. /giveaway start, /giveaway end - button-entry giveaways with auto winner pick
+  7. /announce, /suggest, /report    - server utility commands (whitelist-gated)
+  8. Moderation        - /warn, /warnings, /kick, /ban, /unban, /timeout, /role-all (mass-grant
+                          a role to every current member, in the background)
+  9. Auto-role         - new members automatically get a base role on join
+  10. Anti-nuke         - detects mass channel/role deletion, mass bans, and rogue webhook
+      creation, then times the offender out for 20 minutes and alerts staff — all
+      automatically, without needing a command.
+  11. Runs continuously with auto-reconnect (discord.py handles this internally);
+      for true 24/7 uptime you need to host this on a server that stays on (see README).
+
+Requires: discord.py >= 2.4, Python 3.10+
+"""
+
+import os
+import io
+import json
+import random
+import asyncio
+import datetime
+import time
+from collections import defaultdict
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+GUILD_ID = os.getenv("GUILD_ID")  # optional: speeds up slash command sync during testing
+STAFF_ROLE_NAME = os.getenv("STAFF_ROLE_NAME", "Staff")
+WHITELIST_ROLE_NAME = os.getenv("WHITELIST_ROLE_NAME", "Whitelisted")
+SERVER_NAME = os.getenv("SERVER_NAME", "Dreams RP")
+AUTO_ROLE_NAME = os.getenv("AUTO_ROLE_NAME", "Whitelisted")
+
+# Anti-nuke config
+OWNER_IDS = {int(x) for x in os.getenv("OWNER_IDS", "").split(",") if x.strip().isdigit()}
+ANTI_NUKE_LOG_CHANNEL = os.getenv("ANTI_NUKE_LOG_CHANNEL", "mod-logs")
+ANTI_NUKE_MAX_ACTIONS = int(os.getenv("ANTI_NUKE_MAX_ACTIONS", "3"))
+ANTI_NUKE_WINDOW_SECONDS = int(os.getenv("ANTI_NUKE_WINDOW_SECONDS", "10"))
+ANTI_NUKE_TIMEOUT_MINUTES = int(os.getenv("ANTI_NUKE_TIMEOUT_MINUTES", "20"))
+
+DATA_DIR = os.getenv("DATA_DIR", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+WARNINGS_FILE = os.path.join(DATA_DIR, "warnings.json")
+
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+intents.moderation = True  # ban/unban audit events
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ----------------------------------------------------------------------
+# SIMPLE JSON STORAGE HELPERS
+# ----------------------------------------------------------------------
+def _load(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def _save(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ----------------------------------------------------------------------
+# SERVER STRUCTURE
+# Edit this dict to change what /setup_server builds.
+# Each category maps to a list of (channel_name, channel_type) tuples.
+# channel_type: "text" or "voice"
+# ----------------------------------------------------------------------
+SERVER_STRUCTURE = {
+    "⭐ Server Info": [
+        ("rules", "text"),
+        ("announcements", "text"),
+        ("mini-announcements", "text"),
+        ("related-servers", "text"),
+        ("connect-code", "text"),
+        ("change-logs", "text"),
+        ("teasers", "text"),
+        ("giveaways", "text"),
+        ("restarts", "text"),
+        ("partnership", "text"),
+    ],
+    "⭐ Donations": [
+        ("tebex", "text"),
+        ("coin-guns", "text"),
+        ("prio-list", "text"),
+        ("gangs-for-sale", "text"),
+        ("1of1-guns", "text"),
+        ("dono-cars", "text"),
+    ],
+    "⭐ Chats": [
+        ("non-wl", "text"),
+        ("wl-chat", "text"),
+        ("irl-photo", "text"),
+        ("in-city-clips", "text"),
+        ("live-in-southside", "text"),
+        ("ingame-pictures", "text"),
+        ("whitelisted-items", "text"),
+        ("suggestions", "text"),
+        ("pov", "text"),
+        ("word-around-town", "text"),
+        ("events", "text"),
+    ],
+    "⭐ Support": [
+        ("ticket-hub", "text"),
+        ("staff-feedback", "text"),
+        ("applications", "text"),
+        ("applications-status", "text"),
+        ("bug-reports", "text"),
+        ("player-reports", "text"),
+        ("Public VC #1", "voice"),
+        ("Waiting for Support", "voice"),
+    ],
+    "💗 Female Verification": [
+        ("female-verifier-chat", "text"),
+        ("Waiting for Verify", "voice"),
+        ("Female Verification 1", "voice"),
+        ("Female Verification 2", "voice"),
+    ],
+    "🔒 Staff": [
+        ("staff-chat", "text"),
+        ("staff-announcements", "text"),
+        ("mod-logs", "text"),
+        ("ban-appeals", "text"),
+        ("Staff VC", "voice"),
+    ],
+    # Ticket-type categories are created empty here; ticket channels get created inside
+    # them on demand (see TICKET_TYPES below). Feel free to rename these.
+    "🎫 Ban Ticket": [],
+    "🎫 Female Verify Ticket": [],
+    "🎫 City Report Ticket": [],
+    "🎫 Reimburse Ticket": [],
+    "🎫 Higher Ups": [],
+    "🎫 Ticket Logs": [
+        ("ticket-logs", "text"),
+        ("ban-ticket-logs", "text"),
+        ("female-verify-logs", "text"),
+        ("city-report-logs", "text"),
+        ("reimburse-logs", "text"),
+        ("higher-ups-logs", "text"),
+    ],
+}
+
+# Locked categories: hidden from @everyone, visible to STAFF_ROLE_NAME only.
+LOCKED_CATEGORIES = {"💗 Female Verification", "🔒 Staff", "🎫 Ticket Logs"}
+
+# ----------------------------------------------------------------------
+# TICKET TYPES
+# Each ticket type gets its own category and its own transcript log channel.
+# key must be snake_case (no hyphens) — it's encoded into the ticket channel
+# name so the bot can recover it after a restart. Add/remove types freely.
+# ----------------------------------------------------------------------
+TICKET_TYPES = {
+    "ban": {"label": "Ban Ticket", "emoji": "🔨", "category": "🎫 Ban Ticket", "log_channel": "ban-ticket-logs"},
+    "female_verify": {"label": "Female Verify Ticket", "emoji": "💗", "category": "🎫 Female Verify Ticket", "log_channel": "female-verify-logs"},
+    "city_report": {"label": "City Report Ticket", "emoji": "🏙️", "category": "🎫 City Report Ticket", "log_channel": "city-report-logs"},
+    "reimburse": {"label": "Reimburse Ticket", "emoji": "💸", "category": "🎫 Reimburse Ticket", "log_channel": "reimburse-logs"},
+    "higher_ups": {"label": "Higher Ups", "emoji": "👑", "category": "🎫 Higher Ups", "log_channel": "higher-ups-logs"},
+}
+
+
+async def get_or_create_category(guild: discord.Guild, name: str, staff_role: discord.Role = None) -> discord.CategoryChannel:
+    category = discord.utils.get(guild.categories, name=name)
+    if category is not None:
+        return category
+    overwrites = {}
+    if name in LOCKED_CATEGORIES:
+        overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    return await guild.create_category(name, overwrites=overwrites)
+
+
+# ----------------------------------------------------------------------
+# SETUP COMMAND
+# ----------------------------------------------------------------------
+@bot.tree.command(name="setup_server", description="Build all categories and channels for the server")
+@app_commands.checks.has_permissions(administrator=True)
+async def setup_server(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+
+    staff_role = discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
+    if staff_role is None:
+        staff_role = await guild.create_role(name=STAFF_ROLE_NAME, reason="Auto-created by setup_server")
+
+    created = []
+    for category_name, channels in SERVER_STRUCTURE.items():
+        category = discord.utils.get(guild.categories, name=category_name)
+        if category is None:
+            category = await get_or_create_category(guild, category_name, staff_role)
+            created.append(category_name)
+
+        for chan_name, chan_type in channels:
+            existing = discord.utils.get(category.channels, name=chan_name.lower().replace(" ", "-"))
+            if existing:
+                continue
+            if chan_type == "voice":
+                await guild.create_voice_channel(chan_name, category=category)
+            else:
+                await guild.create_text_channel(chan_name, category=category)
+            created.append(f"{category_name} / {chan_name}")
+
+    await post_ticket_panel(guild)
+
+    await interaction.followup.send(
+        f"Done. Created {len(created)} new categories/channels, and posted the ticket panel in #ticket-hub.",
+        ephemeral=True,
+    )
+
+
+# ----------------------------------------------------------------------
+# TICKET SYSTEM
+# ----------------------------------------------------------------------
+class TicketTypeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=cfg["label"], value=key, emoji=cfg["emoji"])
+            for key, cfg in TICKET_TYPES.items()
+        ]
+        super().__init__(
+            placeholder="Choose a ticket type...",
+            options=options,
+            custom_id="ticket_type_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await open_ticket(interaction, self.values[0])
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketTypeSelect())
+
+
+async def open_ticket(interaction: discord.Interaction, ticket_key: str):
+    cfg = TICKET_TYPES.get(ticket_key)
+    if not cfg:
+        await interaction.response.send_message("Unknown ticket type.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    staff_role = discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
+
+    username_slug = interaction.user.name.lower().replace(" ", "-")
+    channel_name = f"{ticket_key}-{username_slug}"
+    existing = discord.utils.get(guild.text_channels, name=channel_name)
+    if existing:
+        await interaction.response.send_message(f"You already have an open ticket: {existing.mention}", ephemeral=True)
+        return
+
+    category = await get_or_create_category(guild, cfg["category"], staff_role)
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
+    }
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+    ticket_channel = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites)
+
+    embed = discord.Embed(
+        title=cfg["label"],
+        description=f"{interaction.user.mention} thanks for opening a **{cfg['label']}**. Staff will be with you shortly.",
+        color=discord.Color.blurple(),
+    )
+    await ticket_channel.send(embed=embed, view=TicketControlView())
+    await interaction.response.send_message(f"Ticket created: {ticket_channel.mention}", ephemeral=True)
+
+
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.blurple, custom_id="ticket_claim_button")
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return
+        button.disabled = True
+        button.label = f"Claimed by {interaction.user.display_name}"
+        await interaction.response.edit_message(view=self)
+        await interaction.channel.send(f"🔧 {interaction.user.mention} claimed this ticket.")
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="ticket_close_button")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Closing ticket and saving the transcript...")
+        await close_ticket_with_transcript(interaction.channel, interaction.user)
+
+
+async def close_ticket_with_transcript(channel: discord.TextChannel, closer: discord.abc.User):
+    guild = channel.guild
+    ticket_key = channel.name.split("-", 1)[0]
+    cfg = TICKET_TYPES.get(ticket_key)
+    log_channel_name = cfg["log_channel"] if cfg else "ticket-logs"
+    log_channel = discord.utils.get(guild.text_channels, name=log_channel_name) or discord.utils.get(
+        guild.text_channels, name="ticket-logs"
+    )
+
+    lines = []
+    async for msg in channel.history(limit=500, oldest_first=True):
+        stamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
+        content = msg.content or (f"[attachment: {msg.attachments[0].filename}]" if msg.attachments else "[embed]")
+        lines.append(f"[{stamp}] {msg.author}: {content}")
+    transcript_text = "\n".join(lines) if lines else "No messages were sent in this ticket."
+
+    if log_channel:
+        transcript_file = discord.File(io.BytesIO(transcript_text.encode()), filename=f"{channel.name}-transcript.txt")
+        embed = discord.Embed(title="Ticket closed", color=discord.Color.dark_grey())
+        embed.add_field(name="Type", value=cfg["label"] if cfg else "Unknown", inline=True)
+        embed.add_field(name="Channel", value=f"#{channel.name}", inline=True)
+        embed.add_field(name="Closed by", value=closer.mention, inline=True)
+        await log_channel.send(embed=embed, file=transcript_file)
+
+    await channel.send("This ticket will be deleted in 5 seconds.")
+    await asyncio.sleep(5)
+    try:
+        await channel.delete(reason=f"Ticket closed by {closer}")
+    except discord.NotFound:
+        pass
+
+
+async def post_ticket_panel(guild: discord.Guild, channel: discord.TextChannel = None):
+    ticket_hub = channel or discord.utils.get(guild.text_channels, name="ticket-hub")
+    if not ticket_hub:
+        return
+    # avoid duplicate panels
+    async for msg in ticket_hub.history(limit=20):
+        if msg.author == guild.me and msg.embeds and msg.embeds[0].title == "Need Help?":
+            return
+    embed = discord.Embed(
+        title="Need Help?",
+        description="Pick a ticket type from the dropdown below to open a private channel with staff.",
+        color=discord.Color.green(),
+    )
+    await ticket_hub.send(embed=embed, view=TicketPanelView())
+
+
+@bot.tree.command(name="ticket-panel", description="Post the ticket panel in this channel (or #ticket-hub if omitted)")
+@app_commands.describe(channel="Channel to post the panel in (defaults to this channel)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_panel_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    await post_ticket_panel(interaction.guild, channel or interaction.channel)
+    await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
+
+
+# ----------------------------------------------------------------------
+# IMAGE POSTING
+# ----------------------------------------------------------------------
+@bot.tree.command(name="post_image", description="Post an image to a channel")
+@app_commands.describe(channel="Channel to post in", image="Image file to post", caption="Optional caption")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def post_image(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    image: discord.Attachment,
+    caption: str = None,
+):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        await interaction.response.send_message("That attachment isn't an image.", ephemeral=True)
+        return
+    file = await image.to_file()
+    await channel.send(content=caption, file=file)
+    await interaction.response.send_message(f"Posted to {channel.mention}.", ephemeral=True)
+
+
+# ----------------------------------------------------------------------
+# GIVEAWAYS
+# ----------------------------------------------------------------------
+active_giveaways = {}  # message_id -> {channel_id, prize, end_time, winners, entries:set(), ended:bool}
+
+
+class GiveawayView(discord.ui.View):
+    def __init__(self, message_id: int = None):
+        super().__init__(timeout=None)
+        self.message_id = message_id
+
+    @discord.ui.button(label="🎉 Enter", style=discord.ButtonStyle.blurple, custom_id="giveaway_enter_button")
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = active_giveaways.get(interaction.message.id)
+        if not data or data["ended"]:
+            await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+            return
+        if interaction.user.id in data["entries"]:
+            data["entries"].discard(interaction.user.id)
+            await interaction.response.send_message("You left the giveaway.", ephemeral=True)
+        else:
+            data["entries"].add(interaction.user.id)
+            await interaction.response.send_message("You're entered! Good luck 🎉", ephemeral=True)
+
+
+async def end_giveaway(message_id: int):
+    data = active_giveaways.get(message_id)
+    if not data or data["ended"]:
+        return
+    data["ended"] = True
+    channel = bot.get_channel(data["channel_id"])
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(message_id)
+    except discord.NotFound:
+        return
+
+    entries = list(data["entries"])
+    winners_count = min(data["winners"], len(entries))
+    winners = random.sample(entries, winners_count) if winners_count else []
+
+    if winners:
+        mentions = ", ".join(f"<@{uid}>" for uid in winners)
+        result_text = f"Congrats {mentions}! You won **{data['prize']}**."
+    else:
+        result_text = "No valid entries — no winner this time."
+
+    ended_embed = discord.Embed(
+        title="🎉 Giveaway Ended",
+        description=f"**Prize:** {data['prize']}\n{result_text}",
+        color=discord.Color.gold(),
+    )
+    await message.edit(embed=ended_embed, view=None)
+    await channel.send(result_text)
+
+
+@tasks.loop(seconds=30)
+async def giveaway_checker():
+    now = discord.utils.utcnow()
+    for message_id, data in list(active_giveaways.items()):
+        if not data["ended"] and now >= data["end_time"]:
+            await end_giveaway(message_id)
+
+
+giveaway_group = app_commands.Group(name="giveaway", description="Giveaway commands")
+
+
+@giveaway_group.command(name="start", description="Start a giveaway")
+@app_commands.describe(prize="What you're giving away", minutes="How long the giveaway runs, in minutes", winners="Number of winners")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def giveaway_start(interaction: discord.Interaction, prize: str, minutes: int, winners: int = 1):
+    end_time = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+    embed = discord.Embed(
+        title="🎉 Giveaway!",
+        description=f"**Prize:** {prize}\nClick the button below to enter.\nEnds <t:{int(end_time.timestamp())}:R>\nWinners: {winners}",
+        color=discord.Color.gold(),
+    )
+    view = GiveawayView()
+    await interaction.response.send_message(embed=embed, view=view)
+    message = await interaction.original_response()
+
+    active_giveaways[message.id] = {
+        "channel_id": interaction.channel_id,
+        "prize": prize,
+        "end_time": end_time,
+        "winners": winners,
+        "entries": set(),
+        "ended": False,
+    }
+
+
+@giveaway_group.command(name="end", description="End a giveaway early")
+@app_commands.describe(message_id="The message ID of the giveaway to end")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def giveaway_end(interaction: discord.Interaction, message_id: str):
+    try:
+        mid = int(message_id)
+    except ValueError:
+        await interaction.response.send_message("That doesn't look like a valid message ID.", ephemeral=True)
+        return
+    if mid not in active_giveaways:
+        await interaction.response.send_message("No active giveaway with that message ID.", ephemeral=True)
+        return
+    await end_giveaway(mid)
+    await interaction.response.send_message("Giveaway ended.", ephemeral=True)
+
+
+bot.tree.add_command(giveaway_group)
+
+
+# ----------------------------------------------------------------------
+# EXTRA SERVER COMMANDS
+# ----------------------------------------------------------------------
+def has_whitelist_role(member: discord.Member) -> bool:
+    return any(role.name == WHITELIST_ROLE_NAME for role in member.roles)
+
+
+@bot.tree.command(name="announce", description="Post an announcement embed to a channel")
+@app_commands.describe(channel="Channel to post in", title="Announcement title", message="Announcement body")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def announce(interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str):
+    embed = discord.Embed(title=title, description=message, color=discord.Color.red())
+    embed.set_footer(text=SERVER_NAME)
+    await channel.send(embed=embed)
+    await interaction.response.send_message(f"Posted to {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="suggest", description="Submit a suggestion (Whitelisted role only)")
+@app_commands.describe(suggestion="Your suggestion")
+async def suggest(interaction: discord.Interaction, suggestion: str):
+    if not has_whitelist_role(interaction.user):
+        await interaction.response.send_message(
+            f"You need the **{WHITELIST_ROLE_NAME}** role to use this.", ephemeral=True
+        )
+        return
+    channel = discord.utils.get(interaction.guild.text_channels, name="suggestions")
+    if not channel:
+        await interaction.response.send_message("Couldn't find a #suggestions channel.", ephemeral=True)
+        return
+    embed = discord.Embed(description=suggestion, color=discord.Color.blurple())
+    embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+    msg = await channel.send(embed=embed)
+    await msg.add_reaction("👍")
+    await msg.add_reaction("👎")
+    await interaction.response.send_message("Suggestion submitted, thanks!", ephemeral=True)
+
+
+@bot.tree.command(name="report", description="Report a player (Whitelisted role only)")
+@app_commands.describe(player="Who you're reporting (name or @mention)", reason="What happened", evidence="Optional screenshot/clip")
+async def report(interaction: discord.Interaction, player: str, reason: str, evidence: discord.Attachment = None):
+    if not has_whitelist_role(interaction.user):
+        await interaction.response.send_message(
+            f"You need the **{WHITELIST_ROLE_NAME}** role to use this.", ephemeral=True
+        )
+        return
+    channel = discord.utils.get(interaction.guild.text_channels, name="player-reports")
+    if not channel:
+        await interaction.response.send_message("Couldn't find a #player-reports channel.", ephemeral=True)
+        return
+    embed = discord.Embed(title="Player Report", color=discord.Color.orange())
+    embed.add_field(name="Reported by", value=interaction.user.mention, inline=False)
+    embed.add_field(name="Player", value=player, inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    file = await evidence.to_file() if evidence else None
+    if file:
+        embed.set_image(url=f"attachment://{file.filename}")
+        await channel.send(embed=embed, file=file)
+    else:
+        await channel.send(embed=embed)
+    await interaction.response.send_message("Report submitted to staff.", ephemeral=True)
+
+
+# ----------------------------------------------------------------------
+# APPLICATIONS
+# ----------------------------------------------------------------------
+class ApplicationModal(discord.ui.Modal, title="Whitelist Application"):
+    age = discord.ui.TextInput(label="Age", required=True, max_length=3)
+    timezone_field = discord.ui.TextInput(label="Timezone", required=True, max_length=50)
+    experience = discord.ui.TextInput(label="RP Experience", style=discord.TextStyle.paragraph, required=True, max_length=500)
+    why = discord.ui.TextInput(label="Why do you want to join?", style=discord.TextStyle.paragraph, required=True, max_length=500)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        app_channel = discord.utils.get(interaction.guild.text_channels, name="applications")
+        embed = discord.Embed(title="New Application", color=discord.Color.blurple())
+        embed.add_field(name="Applicant", value=interaction.user.mention, inline=False)
+        embed.add_field(name="Age", value=self.age.value, inline=True)
+        embed.add_field(name="Timezone", value=self.timezone_field.value, inline=True)
+        embed.add_field(name="RP Experience", value=self.experience.value, inline=False)
+        embed.add_field(name="Why they want to join", value=self.why.value, inline=False)
+        embed.set_footer(text=f"applicant_id:{interaction.user.id}")
+
+        if app_channel:
+            await app_channel.send(embed=embed, view=ApplicationReviewView())
+            await interaction.response.send_message("Application submitted! We'll DM you the result.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Couldn't find a #applications channel — tell staff.", ephemeral=True)
+
+
+class ApplicationReviewView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @staticmethod
+    def _applicant_id(interaction: discord.Interaction):
+        if not interaction.message.embeds:
+            return None
+        footer = interaction.message.embeds[0].footer.text or ""
+        if footer.startswith("applicant_id:"):
+            return int(footer.split(":", 1)[1])
+        return None
+
+    async def _resolve(self, interaction: discord.Interaction, approved: bool):
+        if not is_staff(interaction.user):
+            await interaction.response.send_message("Staff only.", ephemeral=True)
+            return
+        applicant_id = self._applicant_id(interaction)
+        applicant = interaction.guild.get_member(applicant_id) if applicant_id else None
+
+        if approved and applicant:
+            wl_role = discord.utils.get(interaction.guild.roles, name=WHITELIST_ROLE_NAME)
+            if wl_role:
+                try:
+                    await applicant.add_roles(wl_role, reason="Application approved")
+                except discord.Forbidden:
+                    pass
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        verdict = "✅ Approved" if approved else "❌ Denied"
+        await interaction.channel.send(f"{verdict} by {interaction.user.mention}")
+
+        if applicant:
+            dm_text = (
+                f"Your application to **{SERVER_NAME}** was approved! Welcome in."
+                if approved
+                else f"Your application to **{SERVER_NAME}** was not approved this time."
+            )
+            try:
+                await applicant.send(dm_text)
+            except discord.Forbidden:
+                pass
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.green, custom_id="app_approve_button")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, approved=True)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.red, custom_id="app_deny_button")
+    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, approved=False)
+
+
+@bot.tree.command(name="apply", description="Apply for whitelist")
+async def apply_cmd(interaction: discord.Interaction):
+    await interaction.response.send_modal(ApplicationModal())
+
+
+# ----------------------------------------------------------------------
+# AUTO-REACTIONS & AUTO-THREADS
+# ----------------------------------------------------------------------
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    if message.channel.name == "suggestions":
+        await message.add_reaction("👍")
+        await message.add_reaction("👎")
+    elif message.channel.name == "bug-reports":
+        try:
+            title = (message.content[:50] or "bug report").strip()
+            await message.create_thread(name=f"🐛 {title}")
+        except discord.HTTPException:
+            pass
+
+    await bot.process_commands(message)
+
+
+# ----------------------------------------------------------------------
+# AUTO-ROLE ON JOIN
+# ----------------------------------------------------------------------
+@bot.event
+async def on_member_join(member: discord.Member):
+    role = discord.utils.get(member.guild.roles, name=AUTO_ROLE_NAME)
+    if role is None:
+        role = await member.guild.create_role(name=AUTO_ROLE_NAME, reason="Auto-created base role")
+    try:
+        await member.add_roles(role, reason="Auto-role on join")
+    except discord.Forbidden:
+        pass
+
+
+# ----------------------------------------------------------------------
+# MODERATION
+# ----------------------------------------------------------------------
+def is_staff(member: discord.Member) -> bool:
+    return member.guild_permissions.manage_guild or any(r.name == STAFF_ROLE_NAME for r in member.roles)
+
+
+@bot.tree.command(name="warn", description="Warn a member")
+@app_commands.describe(member="Member to warn", reason="Reason for the warning")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warn(interaction: discord.Interaction, member: discord.Member, reason: str):
+    data = _load(WARNINGS_FILE)
+    guild_key = str(interaction.guild_id)
+    user_key = str(member.id)
+    data.setdefault(guild_key, {}).setdefault(user_key, [])
+    data[guild_key][user_key].append(
+        {"moderator": str(interaction.user), "reason": reason, "timestamp": datetime.datetime.utcnow().isoformat()}
+    )
+    _save(WARNINGS_FILE, data)
+    count = len(data[guild_key][user_key])
+
+    embed = discord.Embed(title="Member warned", color=discord.Color.orange())
+    embed.add_field(name="Member", value=member.mention, inline=True)
+    embed.add_field(name="Total warnings", value=str(count), inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    await interaction.response.send_message(embed=embed)
+    try:
+        await member.send(f"You were warned in **{interaction.guild.name}**: {reason}")
+    except discord.Forbidden:
+        pass
+
+
+@bot.tree.command(name="warnings", description="View a member's warnings")
+@app_commands.describe(member="Member to check")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warnings_cmd(interaction: discord.Interaction, member: discord.Member):
+    data = _load(WARNINGS_FILE)
+    entries = data.get(str(interaction.guild_id), {}).get(str(member.id), [])
+    if not entries:
+        await interaction.response.send_message(f"{member.mention} has no warnings.", ephemeral=True)
+        return
+    embed = discord.Embed(title=f"Warnings for {member}", color=discord.Color.orange())
+    for i, entry in enumerate(entries[-10:], 1):
+        embed.add_field(name=f"#{i} — {entry['moderator']}", value=entry["reason"], inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="kick", description="Kick a member")
+@app_commands.describe(member="Member to kick", reason="Reason")
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason given"):
+    await member.kick(reason=f"{interaction.user}: {reason}")
+    await interaction.response.send_message(f"Kicked {member.mention}. Reason: {reason}")
+
+
+@bot.tree.command(name="ban", description="Ban a member")
+@app_commands.describe(member="Member to ban", reason="Reason")
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason given"):
+    await member.ban(reason=f"{interaction.user}: {reason}")
+    await interaction.response.send_message(f"Banned {member.mention}. Reason: {reason}")
+
+
+@bot.tree.command(name="unban", description="Unban a user by ID")
+@app_commands.describe(user_id="The user ID to unban")
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban(interaction: discord.Interaction, user_id: str):
+    try:
+        user = await bot.fetch_user(int(user_id))
+        await interaction.guild.unban(user)
+        await interaction.response.send_message(f"Unbanned {user}.")
+    except (ValueError, discord.NotFound):
+        await interaction.response.send_message("Couldn't find that user ID in the ban list.", ephemeral=True)
+
+
+@bot.tree.command(name="timeout", description="Time out a member")
+@app_commands.describe(member="Member to time out", minutes="Duration in minutes", reason="Reason")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout(interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "No reason given"):
+    until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+    await member.timeout(until, reason=f"{interaction.user}: {reason}")
+    await interaction.response.send_message(f"Timed out {member.mention} for {minutes} minutes.")
+
+
+@bot.tree.command(name="role-all", description="Give a role to every current member (runs in the background)")
+@app_commands.describe(role="Role to give everyone")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def role_all(interaction: discord.Interaction, role: discord.Role):
+    guild = interaction.guild
+    channel = interaction.channel
+    await interaction.response.send_message(
+        f"Starting — adding {role.mention} to every member. This can take a while on a big server; "
+        f"I'll post here when it's done."
+    )
+
+    async def _run():
+        added, skipped, failed = 0, 0, 0
+        async for member in guild.fetch_members(limit=None):
+            if member.bot or role in member.roles:
+                skipped += 1
+                continue
+            try:
+                await member.add_roles(role, reason=f"/role-all by {interaction.user}")
+                added += 1
+            except discord.Forbidden:
+                failed += 1
+            await asyncio.sleep(0.35)  # stay well under Discord's rate limits
+        await channel.send(
+            f"✅ /role-all finished — gave {role.mention} to **{added}** members "
+            f"({skipped} already had it, {failed} failed due to missing permissions)."
+        )
+
+    bot.loop.create_task(_run())
+
+
+# ----------------------------------------------------------------------
+# ANTI-NUKE
+# Watches for mass-destructive actions (channel deletes, role deletes, bans,
+# rogue webhook creation) done in a short burst, then times the offending
+# member out for ANTI_NUKE_TIMEOUT_MINUTES and pings staff.
+# Server owners and any ID in OWNER_IDS are always exempt.
+# ----------------------------------------------------------------------
+_action_log = defaultdict(list)  # (guild_id, user_id, action) -> [timestamps]
+
+
+async def _get_recent_actor(guild: discord.Guild, action: discord.AuditLogAction, target_id: int = None):
+    try:
+        async for entry in guild.audit_logs(limit=5, action=action):
+            if (discord.utils.utcnow() - entry.created_at).total_seconds() > 15:
+                continue
+            if target_id is not None and getattr(entry.target, "id", None) != target_id:
+                continue
+            return entry.user
+    except discord.Forbidden:
+        return None
+    return None
+
+
+async def _register_action(guild: discord.Guild, user: discord.abc.User, action_name: str):
+    if user is None or user.bot:
+        return
+    if user.id in OWNER_IDS or user.id == guild.owner_id:
+        return
+
+    key = (guild.id, user.id, action_name)
+    now = time.time()
+    _action_log[key] = [t for t in _action_log[key] if now - t < ANTI_NUKE_WINDOW_SECONDS]
+    _action_log[key].append(now)
+
+    if len(_action_log[key]) >= ANTI_NUKE_MAX_ACTIONS:
+        _action_log[key] = []
+        await _punish(guild, user, action_name)
+
+
+async def _punish(guild: discord.Guild, user: discord.abc.User, action_name: str):
+    member = guild.get_member(user.id)
+    log_channel = discord.utils.get(guild.text_channels, name=ANTI_NUKE_LOG_CHANNEL)
+
+    if member:
+        try:
+            until = discord.utils.utcnow() + datetime.timedelta(minutes=ANTI_NUKE_TIMEOUT_MINUTES)
+            await member.timeout(until, reason=f"Anti-nuke: mass {action_name}")
+            outcome = f"timed out for {ANTI_NUKE_TIMEOUT_MINUTES} minutes"
+        except discord.Forbidden:
+            outcome = "detected, but I lack permission to time them out"
+    else:
+        outcome = "detected, but they're no longer in the server"
+
+    if log_channel:
+        embed = discord.Embed(
+            title="🛡️ Anti-nuke triggered",
+            description=f"**{user}** ({user.id}) triggered mass **{action_name}** actions.\nAction taken: **{outcome}**.",
+            color=discord.Color.red(),
+        )
+        await log_channel.send(embed=embed)
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    actor = await _get_recent_actor(channel.guild, discord.AuditLogAction.channel_delete, channel.id)
+    await _register_action(channel.guild, actor, "channel deletion")
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role):
+    actor = await _get_recent_actor(role.guild, discord.AuditLogAction.role_delete, role.id)
+    await _register_action(role.guild, actor, "role deletion")
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    actor = await _get_recent_actor(guild, discord.AuditLogAction.ban, user.id)
+    await _register_action(guild, actor, "member bans")
+
+
+@bot.event
+async def on_webhooks_update(channel: discord.abc.GuildChannel):
+    actor = await _get_recent_actor(channel.guild, discord.AuditLogAction.webhook_create)
+    await _register_action(channel.guild, actor, "webhook creation")
+
+
+# ----------------------------------------------------------------------
+# STARTUP
+# ----------------------------------------------------------------------
+@bot.event
+async def on_ready():
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketControlView())
+    bot.add_view(ApplicationReviewView())
+    bot.add_view(GiveawayView())
+    if not giveaway_checker.is_running():
+        giveaway_checker.start()
+    await bot.change_presence(activity=discord.Game(name=SERVER_NAME))
+    if GUILD_ID:
+        guild_obj = discord.Object(id=int(GUILD_ID))
+        bot.tree.copy_global_to(guild=guild_obj)
+        await bot.tree.sync(guild=guild_obj)
+    else:
+        await bot.tree.sync()
+    print(f"Logged in as {bot.user} — ready for {SERVER_NAME}.")
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("Set DISCORD_BOT_TOKEN in your .env file first.")
+    bot.run(TOKEN)
