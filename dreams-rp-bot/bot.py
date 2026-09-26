@@ -15,7 +15,7 @@ Features:
                           Whitelisted role and DMs the applicant the result
   4. /rules-gate       - "I Agree" button in #rules that unlocks the rest of the server
                           (everything except Server Info is hidden until members click it)
-  5. /self-roles       - dropdown of opt-in ping roles ( 20+, 25+, 18+, 30+,)
+  5. /self-roles       - dropdown of opt-in ping roles (crew, event, giveaway, update pings)
   6. Live FiveM server status embed in #connect-code (players online/offline), if
                           FIVEM_SERVER_IP is set — refreshes automatically
   7. Live member-count voice channel in "📊 Server Stats", refreshed every 10 minutes
@@ -71,7 +71,8 @@ ANTI_NUKE_TIMEOUT_MINUTES = int(os.getenv("ANTI_NUKE_TIMEOUT_MINUTES", "20"))
 # Rules-agree gate: if enabled, new members can only see "⭐ Server Info" until they
 # click "I Agree" in #rules, which grants AUTO_ROLE_NAME and unlocks the rest of the server.
 GATE_ENABLED = os.getenv("GATE_ENABLED", "true").lower() == "true"
-RULES_CHANNEL_NAME = os.getenv("RULES_CHANNEL_NAME", "rules")
+RULES_CHANNEL_NAME = os.getenv("RULES_CHANNEL_NAME", "discord-rules")
+APPLICATIONS_CHANNEL_NAME = os.getenv("APPLICATIONS_CHANNEL_NAME", "pending-apps")
 
 # Live FiveM server status embed (posted/updated in STATUS_CHANNEL_NAME).
 # Leave FIVEM_SERVER_IP blank to disable this feature entirely.
@@ -111,24 +112,6 @@ intents.message_content = True
 intents.moderation = True  # ban/unban audit events
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        msg = f"You're missing permissions to use this: `{', '.join(error.missing_permissions)}`"
-    elif isinstance(error, app_commands.CommandOnCooldown):
-        msg = f"Slow down — try again in {error.retry_after:.1f}s."
-    elif isinstance(error, app_commands.CheckFailure):
-        msg = "You don't have permission to use this command."
-    else:
-        msg = "Something went wrong running that command."
-        print(f"Unhandled app command error: {error!r}")
-
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
 
 
 # ----------------------------------------------------------------------
@@ -199,7 +182,7 @@ def _pick_emoji(channel) -> str:
 
 @bot.tree.command(
     name="fix-channels",
-    description="Rename existing categories/channels and add emojis to any missing one",
+    description="Rename categories/channels per CATEGORY_RENAMES/CHANNEL_RENAMES and add an emoji to any channel missing one",
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def fix_channels(interaction: discord.Interaction):
@@ -259,73 +242,22 @@ async def fix_channels(interaction: discord.Interaction):
 # channel_type: "text" or "voice"
 # ----------------------------------------------------------------------
 SERVER_STRUCTURE = {
-    "⭐ Server Info": [
-        ("rules", "text"),
-        ("announcements", "text"),
-        ("mini-announcements", "text"),
-        ("related-servers", "text"),
-        ("connect-code", "text"),
-        ("change-logs", "text"),
-        ("teasers", "text"),
-        ("giveaways", "text"),
-        ("restarts", "text"),
-        ("partnership", "text"),
-    ],
-    "⭐ Donations": [
-        ("tebex", "text"),
-        ("coin-guns", "text"),
-        ("prio-list", "text"),
-        ("gangs-for-sale", "text"),
-        ("1of1-guns", "text"),
-        ("dono-cars", "text"),
-    ],
-    "⭐ Chats": [
-        ("non-wl", "text"),
-        ("wl-chat", "text"),
-        ("irl-photo", "text"),
-        ("in-city-clips", "text"),
-        ("live-in-southside", "text"),
-        ("ingame-pictures", "text"),
-        ("whitelisted-items", "text"),
-        ("suggestions", "text"),
-        ("pov", "text"),
-        ("word-around-town", "text"),
-        ("events", "text"),
-    ],
-    "⭐ Support": [
-        ("ticket-hub", "text"),
-        ("staff-feedback", "text"),
-        ("applications", "text"),
-        ("applications-status", "text"),
-        ("bug-reports", "text"),
-        ("player-reports", "text"),
-        ("Public VC #1", "voice"),
-        ("Waiting for Support", "voice"),
-    ],
-    "💗 Female Verification": [
-        ("female-verifier-chat", "text"),
-        ("Waiting for Verify", "voice"),
-        ("Female Verification 1", "voice"),
-        ("Female Verification 2", "voice"),
-    ],
-    "🔒 Staff": [
-        ("staff-chat", "text"),
-        ("staff-announcements", "text"),
+    # These reuse categories that already exist on The Dreams RP — get_or_create_category
+    # finds them by exact name and only ADDS the channels below, it never touches or
+    # recreates the category itself, and never touches channels already inside it.
+    "Staff": [
         ("mod-logs", "text"),
         ("server-logs", "text"),
-        ("ban-appeals", "text"),
-        ("Staff VC", "voice"),
     ],
+    "Support": [
+        ("bug-reports", "text"),
+        ("player-reports", "text"),
+    ],
+    # Genuinely new additions — nothing on the real server matches these names, so these
+    # get created fresh the first time /setup_server runs.
     "📊 Server Stats": [
         ("Members: 0", "voice"),
     ],
-    # Ticket-type categories are created empty here; ticket channels get created inside
-    # them on demand (see TICKET_TYPES below). Feel free to rename these.
-    "🎫 Ban Ticket": [],
-    "🎫 Female Verify Ticket": [],
-    "🎫 City Report Ticket": [],
-    "🎫 Reimburse Ticket": [],
-    "🎫 Higher Ups": [],
     "🎫 Ticket Logs": [
         ("ticket-logs", "text"),
         ("ban-ticket-logs", "text"),
@@ -337,20 +269,24 @@ SERVER_STRUCTURE = {
 }
 
 # Locked categories: hidden from @everyone, visible to STAFF_ROLE_NAME only.
-LOCKED_CATEGORIES = {"💗 Female Verification", "🔒 Staff", "🎫 Ticket Logs"}
+# NOTE: this only applies when /setup_server CREATES the category — if it already exists
+# (e.g. your real "Staff" or "Female Verification" categories), its existing permissions
+# are left exactly as they are; nothing here retroactively changes them.
+LOCKED_CATEGORIES = {"Female Verification", "🎫 Ticket Logs"}
 
 # ----------------------------------------------------------------------
 # TICKET TYPES
-# Each ticket type gets its own category and its own transcript log channel.
+# category names below match your server's existing "Ban Ticket", "Female Verify Ticket",
+# etc. categories exactly, so tickets open inside those rather than creating duplicates.
 # key must be snake_case (no hyphens) — it's encoded into the ticket channel
 # name so the bot can recover it after a restart. Add/remove types freely.
 # ----------------------------------------------------------------------
 TICKET_TYPES = {
-    "ban": {"label": "Ban Ticket", "emoji": "🔨", "category": "🎫 Ban Ticket", "log_channel": "ban-ticket-logs"},
-    "female_verify": {"label": "Female Verify Ticket", "emoji": "💗", "category": "🎫 Female Verify Ticket", "log_channel": "female-verify-logs"},
-    "city_report": {"label": "City Report Ticket", "emoji": "🏙️", "category": "🎫 City Report Ticket", "log_channel": "city-report-logs"},
-    "reimburse": {"label": "Reimburse Ticket", "emoji": "💸", "category": "🎫 Reimburse Ticket", "log_channel": "reimburse-logs"},
-    "higher_ups": {"label": "Higher Ups", "emoji": "👑", "category": "🎫 Higher Ups", "log_channel": "higher-ups-logs"},
+    "ban": {"label": "Ban Ticket", "emoji": "🔨", "category": "Ban Ticket", "log_channel": "ban-ticket-logs"},
+    "female_verify": {"label": "Female Verify Ticket", "emoji": "💗", "category": "Female Verify Ticket", "log_channel": "female-verify-logs"},
+    "city_report": {"label": "City Report Ticket", "emoji": "🏙️", "category": "City Report Ticket", "log_channel": "city-report-logs"},
+    "reimburse": {"label": "Reimburse Ticket", "emoji": "💸", "category": "Reimburse Ticket", "log_channel": "reimburse-logs"},
+    "higher_ups": {"label": "Higher Ups", "emoji": "👑", "category": "Higher Ups", "log_channel": "higher-ups-logs"},
 }
 
 
@@ -941,7 +877,7 @@ class ApplicationModal(discord.ui.Modal, title="Whitelist Application"):
     why = discord.ui.TextInput(label="Why do you want to join?", style=discord.TextStyle.paragraph, required=True, max_length=500)
 
     async def on_submit(self, interaction: discord.Interaction):
-        app_channel = discord.utils.get(interaction.guild.text_channels, name="applications")
+        app_channel = discord.utils.get(interaction.guild.text_channels, name=APPLICATIONS_CHANNEL_NAME)
         embed = discord.Embed(title="New Application", color=discord.Color.blurple())
         embed.add_field(name="Applicant", value=interaction.user.mention, inline=False)
         embed.add_field(name="Age", value=self.age.value, inline=True)
@@ -954,7 +890,9 @@ class ApplicationModal(discord.ui.Modal, title="Whitelist Application"):
             await app_channel.send(embed=embed, view=ApplicationReviewView())
             await interaction.response.send_message("Application submitted! We'll DM you the result.", ephemeral=True)
         else:
-            await interaction.response.send_message("Couldn't find a #applications channel — tell staff.", ephemeral=True)
+            await interaction.response.send_message(
+                f"Couldn't find a #{APPLICATIONS_CHANNEL_NAME} channel — tell staff.", ephemeral=True
+            )
 
 
 class ApplicationReviewView(discord.ui.View):
