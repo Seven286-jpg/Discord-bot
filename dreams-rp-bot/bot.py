@@ -113,6 +113,24 @@ intents.moderation = True  # ban/unban audit events
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = f"You're missing permissions to use this: `{', '.join(error.missing_permissions)}`"
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        msg = f"Slow down — try again in {error.retry_after:.1f}s."
+    elif isinstance(error, app_commands.CheckFailure):
+        msg = "You don't have permission to use this command."
+    else:
+        msg = "Something went wrong running that command."
+        print(f"Unhandled app command error: {error!r}")
+
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
 # ----------------------------------------------------------------------
 # SIMPLE JSON STORAGE HELPERS
 # ----------------------------------------------------------------------
@@ -181,7 +199,7 @@ def _pick_emoji(channel) -> str:
 
 @bot.tree.command(
     name="fix-channels",
-    description="Rename categories/channels per CATEGORY_RENAMES/CHANNEL_RENAMES and add an emoji to any channel missing one",
+    description="Rename existing categories/channels and add emojis to any missing one",
 )
 @app_commands.checks.has_permissions(administrator=True)
 async def fix_channels(interaction: discord.Interaction):
