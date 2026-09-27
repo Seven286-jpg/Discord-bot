@@ -173,11 +173,26 @@ CHANNEL_RENAMES = {
 # Keyword -> emoji used only for channels that don't already start with an emoji.
 # Checked in order, first match wins; falls back to a generic emoji at the end.
 EMOJI_KEYWORDS = [
-    ("rule", "📜"),
-    ("ticket", "🎫"),
-    ("staff", "🛡️"),
+    # keep specific/compound keywords above their broader relatives so they match first
+    ("female-verif", "💗"), ("female", "💗"), ("verif", "🪪"),
+    ("ban-appeal", "⚖️"), ("ban", "🔨"), ("mute", "🔇"), ("punish", "😡"), ("mod-log", "📕"),
+    ("ticket-log", "🗂️"), ("ticket", "🎫"),
+    ("staff-chat", "🗯️"), ("staff-announce", "📯"), ("staff", "🛡️"),
+    ("interview", "🗣️"), ("training", "✍️"),
+    ("apply", "📝"), ("application", "📝"), ("pending", "⏳"), ("denied", "🙅"), ("approved", "✅"),
+    ("rule", "📜"), ("law", "⚖️"),
+    ("announce", "📢"), ("update", "🆕"), ("changelog", "🧾"), ("hotfix", "🔧"), ("patch", "🔧"),
+    ("donat", "💰"), ("tebex", "💳"), ("prio", "⭐"), ("gang", "🔫"), ("gun", "🔫"), ("car", "🚗"),
+    ("suggest", "💡"), ("feedback", "📮"), ("poll", "🗳️"), ("vote", "🗳️"),
+    ("report", "🚨"), ("complaint", "🚨"), ("tos", "🚫"),
+    ("giveaway", "🎁"), ("event", "🎉"), ("party", "🎊"), ("celebrat", "🎉"),
+    ("welcome", "👋"), ("community", "🌐"), ("general", "💬"),
+    ("connect", "🔌"), ("watermark", "⚡"), ("hiring", "🔔"), ("job", "🧰"),
+    ("photo", "📷"), ("pic", "📸"), ("clip", "🎬"), ("snippet", "🎞️"), ("stream", "🎥"), ("media", "🎥"),
+    ("baddie", "🌸"), ("gossip", "🗞️"),
+    ("management", "👥"), ("responsib", "📋"), ("role", "🎭"), ("perm", "🔑"),
+    ("bug", "🪲"), ("player-report", "🚨"),
     ("log", "📝"),
-    ("announce", "📢"),
 ]
 DEFAULT_TEXT_EMOJI = "💬"
 DEFAULT_VOICE_EMOJI = "🔊"
