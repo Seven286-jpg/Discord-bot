@@ -877,7 +877,7 @@ async def suggest(interaction: discord.Interaction, suggestion: str):
 @bot.tree.command(name="report", description="Report a player (Whitelisted role only)")
 @app_commands.describe(player="Who you're reporting (name or @mention)", reason="What happened", evidence="Optional screenshot/clip")
 async def report(interaction: discord.Interaction, player: str, reason: str, evidence: discord.Attachment = None):
-    if not has_whitelist_role(interaction.user):
+        if not has_whitelist_role(interaction.user):
         await interaction.response.send_message(
             f"You need the **{WHITELIST_ROLE_NAME}** role to use this.", ephemeral=True
         )
@@ -897,7 +897,6 @@ async def report(interaction: discord.Interaction, player: str, reason: str, evi
     else:
         await channel.send(embed=embed)
     await interaction.response.send_message("Report submitted to staff.", ephemeral=True)
- await _register_action(channel.guild, actor, "webhook creation")
 
 
 
