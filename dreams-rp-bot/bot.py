@@ -45,6 +45,7 @@ import random
 import asyncio
 import datetime
 import time
+import urllib.parse
 from collections import defaultdict
 import discord
 import aiohttp
@@ -89,6 +90,22 @@ AUTOMOD_SPAM_LIMIT = int(os.getenv("AUTOMOD_SPAM_LIMIT", "5"))  # messages
 AUTOMOD_SPAM_WINDOW = int(os.getenv("AUTOMOD_SPAM_WINDOW", "6"))  # seconds
 AUTOMOD_SPAM_TIMEOUT_MINUTES = int(os.getenv("AUTOMOD_SPAM_TIMEOUT_MINUTES", "5"))
 _INVITE_REGEX = re.compile(r"(discord\.gg/|discord(?:app)?\.com/invite/)", re.IGNORECASE)
+
+# Any-other-link soft-ban (separate from the invite-link rule above, and treated as part of
+# the server's anti-nuke/anti-scam protection since unsolicited links are a common attack
+# vector). Domains in LINK_ALLOWED_DOMAINS are never actioned.
+AUTOMOD_BLOCK_ALL_LINKS = os.getenv("AUTOMOD_BLOCK_ALL_LINKS", "true").lower() == "true"
+AUTOMOD_LINK_ACTION = os.getenv("AUTOMOD_LINK_ACTION", "softban")  # softban | ban | kick | timeout | delete
+LINK_TIMEOUT_MINUTES = int(os.getenv("LINK_TIMEOUT_MINUTES", "60"))  # only used if AUTOMOD_LINK_ACTION=timeout
+LINK_ALLOWED_DOMAINS = {
+    d.strip().lower()
+    for d in os.getenv(
+        "LINK_ALLOWED_DOMAINS",
+        "tenor.com,giphy.com,cfx.re,youtube.com,youtu.be,twitter.com,x.com,imgur.com",
+    ).split(",")
+    if d.strip()
+}
+_URL_REGEX = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
 # Server logs (join/leave, message edit/delete)
 SERVER_LOG_CHANNEL_NAME = os.getenv("SERVER_LOG_CHANNEL_NAME", "server-logs")
@@ -994,6 +1011,13 @@ async def run_automod(message: discord.Message) -> bool:
             pass
         return True
 
+    if AUTOMOD_BLOCK_ALL_LINKS and message.channel.name.lower() not in AUTOMOD_EXEMPT_CHANNELS:
+        for match in _URL_REGEX.finditer(message.content):
+            domain = _extract_domain(match.group(0))
+            if domain and not any(domain == d or domain.endswith("." + d) for d in LINK_ALLOWED_DOMAINS):
+                await handle_link_violation(message, domain)
+                return True
+
     key = (message.guild.id, message.author.id)
     now = time.time()
     _spam_tracker[key] = [t for t in _spam_tracker[key] if now - t < AUTOMOD_SPAM_WINDOW]
@@ -1012,6 +1036,66 @@ async def run_automod(message: discord.Message) -> bool:
         return True
 
     return False
+
+
+def _extract_domain(url: str) -> str:
+    if not url.lower().startswith("http"):
+        url = "http://" + url
+    try:
+        return urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+    except ValueError:
+        return ""
+
+
+async def handle_link_violation(message: discord.Message, domain: str):
+    guild = message.guild
+    member = message.author
+
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
+
+    action_desc = {
+        "softban": "You've been soft-banned (removed and immediately allowed back, with your recent messages cleared).",
+        "ban": "You've been banned as a result.",
+        "kick": "You've been kicked as a result.",
+        "timeout": f"You've been timed out for {LINK_TIMEOUT_MINUTES} minutes as a result.",
+        "delete": "",
+    }.get(AUTOMOD_LINK_ACTION, "")
+    try:
+        await member.send(
+            f"Your message in **{guild.name}** contained a link to `{domain}`, which isn't allowed here. {action_desc}"
+        )
+    except discord.Forbidden:
+        pass
+
+    outcome = "message deleted only"
+    try:
+        if AUTOMOD_LINK_ACTION == "softban":
+            await guild.ban(member, reason=f"Automod: disallowed link ({domain})", delete_message_seconds=86400)
+            await guild.unban(member, reason="Softban complete — messages cleared")
+            outcome = "soft-banned (kicked + recent messages cleared)"
+        elif AUTOMOD_LINK_ACTION == "ban":
+            await guild.ban(member, reason=f"Automod: disallowed link ({domain})")
+            outcome = "banned"
+        elif AUTOMOD_LINK_ACTION == "kick":
+            await member.kick(reason=f"Automod: disallowed link ({domain})")
+            outcome = "kicked"
+        elif AUTOMOD_LINK_ACTION == "timeout":
+            until = discord.utils.utcnow() + datetime.timedelta(minutes=LINK_TIMEOUT_MINUTES)
+            await member.timeout(until, reason=f"Automod: disallowed link ({domain})")
+            outcome = f"timed out for {LINK_TIMEOUT_MINUTES} minutes"
+    except discord.Forbidden:
+        outcome = f"flagged, but I lack permission to {AUTOMOD_LINK_ACTION}"
+
+    log_channel = discord.utils.get(guild.text_channels, name=ANTI_NUKE_LOG_CHANNEL)
+    if log_channel:
+        embed = discord.Embed(title="🔗 Disallowed link posted", color=discord.Color.red())
+        embed.add_field(name="Member", value=f"{member} ({member.id})", inline=False)
+        embed.add_field(name="Domain", value=domain, inline=True)
+        embed.add_field(name="Action taken", value=outcome, inline=True)
+        await log_channel.send(embed=embed)
 
 
 def get_server_log_channel(guild: discord.Guild):
