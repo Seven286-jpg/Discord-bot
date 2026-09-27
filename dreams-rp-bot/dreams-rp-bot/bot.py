@@ -897,6 +897,120 @@ async def report(interaction: discord.Interaction, player: str, reason: str, evi
     else:
         await channel.send(embed=embed)
     await interaction.response.send_message("Report submitted to staff.", ephemeral=True)
+ await _register_action(channel.guild, actor, "webhook creation")
+
+
+
+# ----------------------------------------------------------------------
+# RAILWAY BOT MANAGEMENT (requires RAILWAY_API_TOKEN and RAILWAY_SERVICE_ID)
+# ----------------------------------------------------------------------
+import aiohttp
+
+RAILWAY_API_TOKEN = os.getenv("RAILWAY_API_TOKEN")
+RAILWAY_SERVICE_ID = os.getenv("RAILWAY_SERVICE_ID")
+RAILWAY_API_URL = "https://api.railway.app/graphql"
+
+async def toggle_bot_sleep(sleep: bool) -> dict:
+    """
+    Toggle the bot's sleep state via Railway API.
+    Returns: {"success": bool, "message": str}
+    """
+    if not RAILWAY_API_TOKEN or not RAILWAY_SERVICE_ID:
+        return {"success": False, "message": "Railway API credentials not configured. Contact the bot owner."}
+    
+    # GraphQL mutation to update service config
+    mutation = """
+    mutation UpdateServiceDeploy($input: ServiceDeployConfigInput!) {
+        serviceDeployConfigUpdate(input: $input) {
+            success
+        }
+    }
+    """
+    
+    variables = {
+        "input": {
+            "serviceId": RAILWAY_SERVICE_ID,
+            "sleepApplication": sleep
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                RAILWAY_API_URL,
+                json={"query": mutation, "variables": variables},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+                
+                if "errors" in data:
+                    error_msg = data["errors"][0].get("message", "Unknown error")
+                    return {"success": False, "message": f"Railway API error: {error_msg}"}
+                
+                if data.get("data", {}).get("serviceDeployConfigUpdate", {}).get("success"):
+                    return {"success": True, "message": "Sleep state updated successfully."}
+                else:
+                    return {"success": False, "message": "Failed to update sleep state."}
+    except asyncio.TimeoutError:
+        return {"success": False, "message": "Railway API request timed out."}
+    except Exception as e:
+        return {"success": False, "message": f"Error: {str(e)}"}
+
+
+def is_owner(user: discord.abc.User) -> bool:
+    """Check if user is a bot owner."""
+    return user.id in OWNER_IDS or user.id == 0  # owner check; adjust OWNER_IDS if needed
+
+
+@bot.tree.command(name="manage-bot", description="Wake or sleep the bot (Owner only)")
+@app_commands.describe(action="Choose 'wake' to bring the bot online or 'sleep' to take it offline")
+async def manage_bot(interaction: discord.Interaction, action: str):
+    # Check permissions
+    if not is_owner(interaction.user):
+        await interaction.response.send_message(
+            "This command is for the bot owner only.",
+            ephemeral=True
+        )
+        return
+    
+    if action.lower() not in ["wake", "sleep"]:
+        await interaction.response.send_message(
+            "Invalid action. Use 'wake' or 'sleep'.",
+            ephemeral=True
+        )
+        return
+    
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    
+    should_sleep = action.lower() == "sleep"
+    result = await toggle_bot_sleep(should_sleep)
+    
+    if result["success"]:
+        status = "🌙 **Going to sleep...** (offline)" if should_sleep else "🌟 **Waking up!** (online)"
+        embed = discord.Embed(
+            title="Bot Management",
+            description=f"{status}\n{result['message']}",
+            color=discord.Color.blurple() if should_sleep else discord.Color.green()
+        )
+    else:
+        embed = discord.Embed(
+            title="Bot Management - Error",
+            description=result["message"],
+            color=discord.Color.red()
+        )
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ----------------------------------------------------------------------
+# STARTUP
+# ----------------------------------------------------------------------
 
 
 # ----------------------------------------------------------------------
