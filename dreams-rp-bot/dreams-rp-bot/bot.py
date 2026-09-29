@@ -84,7 +84,7 @@ APPLICATIONS_CHANNEL_NAME = os.getenv("APPLICATIONS_CHANNEL_NAME", "pending-apps
 FIVEM_SERVER_IP = os.getenv("FIVEM_SERVER_IP", "")  # e.g. "203.0.113.10:30120"
 CFX_JOIN_CODE = os.getenv("CFX_JOIN_CODE", "")  # e.g. "abcd12" -> cfx.re/join/abcd12
 STATUS_CHANNEL_NAME = os.getenv("STATUS_CHANNEL_NAME", "connect-code")
-STATUS_UPDATE_MINUTES = int(os.getenv("STATUS_UPDATE_MINUTES", "5"))
+STATUS_UPDATE_MINUTES = int(os.getenv("STATUS_UPDATE_MINUTES", "1"))
 
 # Auto-mod
 AUTOMOD_BANNED_WORDS = {w.strip().lower() for w in os.getenv("AUTOMOD_BANNED_WORDS", "").split(",") if w.strip()}
@@ -713,14 +713,14 @@ async def update_server_status():
         channel = discord.utils.get(guild.text_channels, name=STATUS_CHANNEL_NAME)
         if not channel:
             continue
-        posted = False
+        # delete the previous status message(s) rather than editing, then post a fresh one
         async for msg in channel.history(limit=20):
             if msg.author == guild.me and msg.embeds and msg.embeds[0].title and msg.embeds[0].title.startswith(("🟢", "🔴")):
-                await msg.edit(embed=embed)
-                posted = True
-                break
-        if not posted:
-            await channel.send(embed=embed)
+                try:
+                    await msg.delete()
+                except discord.NotFound:
+                    pass
+        await channel.send(embed=embed)
 
 
 # ----------------------------------------------------------------------
