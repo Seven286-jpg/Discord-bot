@@ -654,14 +654,25 @@ async def fetch_fivem_status():
     # at all (only works if your server shows up on the FiveM server list / servers.fivem.net).
     if CFX_JOIN_CODE:
         url = f"https://servers-frontend.fivem.net/api/servers/single/{CFX_JOIN_CODE}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Accept": "application/json",
+        }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    raw_text = await resp.text()
                     if resp.status != 200:
+                        print(f"FiveM status: CFX API returned HTTP {resp.status} for code '{CFX_JOIN_CODE}': {raw_text[:300]!r}")
                         return {"online": False}
-                    payload = await resp.json(content_type=None)
+                    try:
+                        payload = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        print(f"FiveM status: CFX API returned non-JSON for code '{CFX_JOIN_CODE}': {raw_text[:300]!r}")
+                        return {"online": False}
                     data = payload.get("Data") or {}
                     if not data:
+                        print(f"FiveM status: CFX API had no 'Data' for code '{CFX_JOIN_CODE}' — check the code is correct and the server is public. Raw: {raw_text[:300]!r}")
                         return {"online": False}
                     return {
                         "online": True,
@@ -669,7 +680,8 @@ async def fetch_fivem_status():
                         "max": data.get("sv_maxclients", "?"),
                         "hostname": data.get("hostname", SERVER_NAME),
                     }
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"FiveM status: request failed for code '{CFX_JOIN_CODE}': {e!r}")
             return {"online": False}
 
     # Fallback: direct IP:port, if you'd rather use that instead
