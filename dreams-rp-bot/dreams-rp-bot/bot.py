@@ -82,7 +82,10 @@ APPLICATIONS_CHANNEL_NAME = os.getenv("APPLICATIONS_CHANNEL_NAME", "pending-apps
 # Live FiveM server status embed (posted/updated in STATUS_CHANNEL_NAME).
 # Leave FIVEM_SERVER_IP blank to disable this feature entirely.
 FIVEM_SERVER_IP = os.getenv("FIVEM_SERVER_IP", "")  # e.g. "203.0.113.10:30120"
-CFX_JOIN_CODE = os.getenv("CFX_JOIN_CODE", "")  # e.g. "abcd12" -> cfx.re/join/abcd12
+CFX_JOIN_CODE = os.getenv("CFX_JOIN_CODE", "").strip()
+if CFX_JOIN_CODE:
+    # tolerate a full link being pasted in (https://cfx.re/join/abcd12, cfx.re/join/abcd12, etc.)
+    CFX_JOIN_CODE = re.sub(r"^(https?://)?(www\.)?cfx\.re/join/", "", CFX_JOIN_CODE, flags=re.IGNORECASE).strip("/ ")
 STATUS_CHANNEL_NAME = os.getenv("STATUS_CHANNEL_NAME", "connect-code")
 STATUS_UPDATE_MINUTES = int(os.getenv("STATUS_UPDATE_MINUTES", "1"))
 
