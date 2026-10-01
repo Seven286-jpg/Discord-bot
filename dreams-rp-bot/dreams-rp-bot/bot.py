@@ -1680,6 +1680,37 @@ async def role_all(interaction: discord.Interaction, role: discord.Role):
     bot.loop.create_task(_run())
  
  
+@bot.tree.command(name="role-remove-all", description="Remove a role from every current member (runs in the background)")
+@app_commands.describe(role="Role to remove from everyone")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def role_remove_all(interaction: discord.Interaction, role: discord.Role):
+    guild = interaction.guild
+    channel = interaction.channel
+    await interaction.response.send_message(
+        f"Starting — removing {role.mention} from every member. This can take a while on a big server; "
+        f"I'll post here when it's done."
+    )
+
+    async def _run():
+        removed, skipped, failed = 0, 0, 0
+        async for member in guild.fetch_members(limit=None):
+            if role not in member.roles:
+                skipped += 1
+                continue
+            try:
+                await member.remove_roles(role, reason=f"/role-remove-all by {interaction.user}")
+                removed += 1
+            except discord.Forbidden:
+                failed += 1
+            await asyncio.sleep(0.35)  # stay well under Discord's rate limits
+        await channel.send(
+            f"✅ /role-remove-all finished — removed {role.mention} from **{removed}** members "
+            f"({skipped} didn't have it, {failed} failed due to missing permissions)."
+        )
+
+    bot.loop.create_task(_run())
+ 
+ 
 # ----------------------------------------------------------------------
 # ANTI-NUKE
 # Watches for mass-destructive actions (channel deletes, role deletes, bans,
