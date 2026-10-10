@@ -79,6 +79,11 @@ GATE_ENABLED = os.getenv("GATE_ENABLED", "true").lower() == "true"
 RULES_CHANNEL_NAME = os.getenv("RULES_CHANNEL_NAME", "discord-rules")
 APPLICATIONS_CHANNEL_NAME = os.getenv("APPLICATIONS_CHANNEL_NAME", "pending-apps")
 
+# Where ticket categories go when the bot creates/arranges them: "top" (default), "bottom",
+# "above:<category name>" or "below:<category name>". Newest ticket sits at the top of its category.
+TICKET_CATEGORY_PLACEMENT = os.getenv("TICKET_CATEGORY_PLACEMENT", "top")
+TICKET_NEWEST_FIRST = os.getenv("TICKET_NEWEST_FIRST", "true").lower() == "true"
+
 # Live FiveM server status embed (posted/updated in STATUS_CHANNEL_NAME).
 # Leave FIVEM_SERVER_IP blank to disable this feature entirely.
 FIVEM_SERVER_IP = os.getenv("FIVEM_SERVER_IP", "")  # e.g. "203.0.113.10:30120"
@@ -380,6 +385,44 @@ async def get_or_create_category(
     return await guild.create_category(name, overwrites=overwrites)
 
 
+async def arrange_categories(guild, cats, above=None):
+    """Put `cats` (in order) together as one block: directly above `above` if given, otherwise
+    wherever TICKET_CATEGORY_PLACEMENT says. Returns the last category in the block."""
+    cats = [c for c in cats if c]
+    if not cats:
+        return None
+    block_ids = {c.id for c in cats}
+    if above is not None and above.id in block_ids:
+        above = None
+    first = cats[0]
+    try:
+        direction, _, anchor_name = TICKET_CATEGORY_PLACEMENT.strip().partition(":")
+        direction = direction.strip().lower()
+        anchor = None
+        if above is None and direction in ("above", "below"):
+            anchor = find_category(guild, anchor_name.strip())
+            if anchor is not None and anchor.id in block_ids:
+                anchor = None
+        if above is not None:
+            await first.move(before=above)
+        elif anchor is not None and direction == "above":
+            await first.move(before=anchor)
+        elif anchor is not None and direction == "below":
+            await first.move(after=anchor)
+        elif direction == "bottom":
+            await first.move(end=True)
+        else:
+            await first.move(beginning=True)
+        prev = first
+        for c in cats[1:]:
+            await c.move(after=prev)
+            prev = c
+        return prev
+    except (discord.HTTPException, TypeError) as e:
+        print(f"Couldn't arrange ticket categories: {e!r}")
+        return None
+
+
 # ----------------------------------------------------------------------
 # SETUP COMMAND
 # ----------------------------------------------------------------------
@@ -413,6 +456,15 @@ async def setup_server(interaction: discord.Interaction):
             else:
                 await guild.create_text_channel(chan_name, category=category)
             created.append(f"{category_name} / {chan_name}")
+
+    # Every ticket type gets its category up front (existing ones are reused and left where they are).
+    new_ticket_cats = []
+    for cfg in TICKET_TYPES.values():
+        if find_category(guild, cfg["category"]) is None:
+            new_ticket_cats.append(await get_or_create_category(guild, cfg["category"], staff_role))
+            created.append(cfg["category"])
+    if new_ticket_cats:
+        await arrange_categories(guild, new_ticket_cats)
 
     # Server Stats voice channel is view-only — nobody should be able to join it.
     stats_category = discord.utils.get(guild.categories, name="📊 Server Stats")
@@ -487,8 +539,16 @@ async def open_ticket(interaction: discord.Interaction, ticket_key: str):
     try:
         # Finds this ticket type's own category (e.g. "Ban Ticket", "Higher Ups") even if it has
         # an emoji or different spacing in its name; only creates one if it truly doesn't exist.
+        category_existed = find_category(guild, cfg["category"]) is not None
         category = await get_or_create_category(guild, cfg["category"], staff_role)
+        if not category_existed:
+            await arrange_categories(guild, [category])
         ticket_channel = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites)
+        if TICKET_NEWEST_FIRST:
+            try:
+                await ticket_channel.move(beginning=True, category=category)
+            except (discord.HTTPException, TypeError):
+                pass
     except discord.Forbidden:
         await interaction.followup.send(
             "I don't have permission to create ticket channels — tell staff.", ephemeral=True
@@ -585,6 +645,36 @@ async def post_ticket_panel(guild: discord.Guild, channel: discord.TextChannel =
 async def ticket_panel_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
     await post_ticket_panel(interaction.guild, channel or interaction.channel)
     await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
+
+
+@bot.tree.command(name="ticket-categories", description="Create missing ticket categories and move them all into place")
+@app_commands.describe(above="Put the ticket categories directly above this category (default: top of the server)")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticket_categories_cmd(interaction: discord.Interaction, above: discord.CategoryChannel = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    guild = interaction.guild
+    staff_role = discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
+    cats, created = [], []
+    for cfg in TICKET_TYPES.values():
+        cat = find_category(guild, cfg["category"])
+        if cat is None:
+            cat = await get_or_create_category(guild, cfg["category"], staff_role)
+            created.append(cat.name)
+        cats.append(cat)
+    last = await arrange_categories(guild, cats, above=above)
+    logs_cat = find_category(guild, "🎫 Ticket Logs")
+    if last is not None and logs_cat is not None and logs_cat.id not in {c.id for c in cats}:
+        try:
+            await logs_cat.move(after=last)
+        except (discord.HTTPException, TypeError):
+            pass
+    where = f"directly above **{above.name}**" if above else f"to the spot set by TICKET_CATEGORY_PLACEMENT ({TICKET_CATEGORY_PLACEMENT})"
+    await interaction.followup.send(
+        f"Done. Created {len(created)} missing ticket categories"
+        + (f" ({', '.join(created)})" if created else "")
+        + f" and moved all {len(cats)} {where}.",
+        ephemeral=True,
+    )
 
 
 # ----------------------------------------------------------------------
