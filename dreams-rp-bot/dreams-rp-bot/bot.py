@@ -42,6 +42,7 @@ Requires: discord.py >= 2.4, Python 3.10+
 import os
 import io
 import re
+import html
 import json
 import random
 import asyncio
@@ -83,6 +84,8 @@ APPLICATIONS_CHANNEL_NAME = os.getenv("APPLICATIONS_CHANNEL_NAME", "pending-apps
 # "above:<category name>" or "below:<category name>". Newest ticket sits at the top of its category.
 TICKET_CATEGORY_PLACEMENT = os.getenv("TICKET_CATEGORY_PLACEMENT", "top")
 TICKET_NEWEST_FIRST = os.getenv("TICKET_NEWEST_FIRST", "true").lower() == "true"
+# Also DM the person who opened the ticket a copy of the transcript when it closes.
+TICKET_DM_TRANSCRIPT = os.getenv("TICKET_DM_TRANSCRIPT", "false").lower() == "true"
 
 # Live FiveM server status embed (posted/updated in STATUS_CHANNEL_NAME).
 # Leave FIVEM_SERVER_IP blank to disable this feature entirely.
@@ -591,31 +594,187 @@ class TicketControlView(discord.ui.View):
         await close_ticket_with_transcript(interaction.channel, interaction.user)
 
 
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+
+def find_text_channel(guild: discord.Guild, name: str):
+    """Exact name first, then ignoring emoji/dots/dashes — so '🗂️.ban-ticket-logs' still counts
+    as 'ban-ticket-logs' (e.g. after /fix-channels added an emoji to it)."""
+    exact = discord.utils.get(guild.text_channels, name=name)
+    if exact:
+        return exact
+    wanted = _norm_name(name)
+    if not wanted:
+        return None
+    for ch in guild.text_channels:
+        if _norm_name(ch.name) == wanted:
+            return ch
+    return None
+
+
+def _resolve_mentions(guild: discord.Guild, text: str) -> str:
+    def repl(m):
+        member = guild.get_member(int(m.group(1)))
+        return f"@{member.display_name}" if member else f"@{m.group(1)}"
+
+    return _MENTION_RE.sub(repl, text or "")
+
+
+async def build_transcript(channel: discord.TextChannel) -> dict:
+    """Reads the whole ticket and returns plain-text + HTML versions plus who opened/claimed it."""
+    guild = channel.guild
+    rows = []
+    opener_id = claimed_id = None
+    async for msg in channel.history(limit=2000, oldest_first=True):
+        embed_lines = []
+        for e in msg.embeds:
+            parts = [p for p in (e.title, e.description) if p]
+            parts += [f"{f.name}: {f.value}" for f in e.fields]
+            if parts:
+                embed_lines.append(_resolve_mentions(guild, " — ".join(parts)))
+        if msg.author.id == bot.user.id:
+            if opener_id is None and msg.embeds and msg.embeds[0].description:
+                m = _MENTION_RE.search(msg.embeds[0].description)
+                if m:
+                    opener_id = int(m.group(1))
+            if "claimed this ticket" in (msg.content or ""):
+                m = _MENTION_RE.search(msg.content)
+                if m:
+                    claimed_id = int(m.group(1))
+        rows.append(
+            {
+                "author": str(msg.author),
+                "avatar": msg.author.display_avatar.url,
+                "stamp": msg.created_at.strftime("%Y-%m-%d %H:%M UTC"),
+                "created": msg.created_at,
+                "text": _resolve_mentions(guild, msg.clean_content),
+                "embeds": embed_lines,
+                "atts": [(a.filename, a.url) for a in msg.attachments],
+            }
+        )
+
+    txt_lines = []
+    for r in rows:
+        first = r["text"] or ("[no text]" if not (r["embeds"] or r["atts"]) else "")
+        txt_lines.append(f"[{r['stamp']}] {r['author']}: {first}".rstrip())
+        txt_lines += [f"    [embed] {e}" for e in r["embeds"]]
+        txt_lines += [f"    [attachment] {fn} ({url})" for fn, url in r["atts"]]
+    txt = "\n".join(txt_lines) if txt_lines else "No messages were sent in this ticket."
+
+    return {
+        "txt": txt,
+        "html": _render_transcript_html(channel.name, guild.name, rows),
+        "count": len(rows),
+        "opener_id": opener_id,
+        "claimed_id": claimed_id,
+        "first_at": rows[0]["created"] if rows else None,
+    }
+
+
+def _render_transcript_html(channel_name: str, guild_name: str, rows: list) -> str:
+    esc = html.escape
+    out = [
+        '<!DOCTYPE html><html><head><meta charset="utf-8">',
+        f"<title>Transcript - {esc(channel_name)}</title>",
+        "<style>"
+        "body{background:#313338;color:#dbdee1;font-family:Arial,Helvetica,sans-serif;margin:0;padding:20px;max-width:900px}"
+        "h2{color:#fff;margin:0 0 4px}.meta{color:#949ba4;font-size:13px;margin-bottom:18px}"
+        ".msg{display:flex;gap:12px;margin:14px 0}.avatar{width:40px;height:40px;border-radius:50%;flex-shrink:0}"
+        ".name{font-weight:700;color:#fff}.time{color:#949ba4;font-size:12px;margin-left:8px}"
+        ".content{white-space:pre-wrap;word-wrap:break-word;margin-top:2px}"
+        ".embed{border-left:4px solid #5865f2;background:#2b2d31;padding:8px 12px;margin-top:6px;border-radius:4px;white-space:pre-wrap}"
+        ".att{margin-top:6px;font-size:13px}.att a{color:#00a8fc}"
+        "</style></head><body>",
+        f"<h2>Ticket transcript - #{esc(channel_name)}</h2>",
+        f'<div class="meta">{esc(guild_name)} &middot; {len(rows)} messages</div>',
+    ]
+    for r in rows:
+        out.append('<div class="msg">')
+        out.append(f'<img class="avatar" src="{esc(r["avatar"])}" alt="">')
+        out.append(f'<div><span class="name">{esc(r["author"])}</span><span class="time">{esc(r["stamp"])}</span>')
+        if r["text"]:
+            out.append(f'<div class="content">{esc(r["text"])}</div>')
+        for e in r["embeds"]:
+            out.append(f'<div class="embed">{esc(e)}</div>')
+        for fn, url in r["atts"]:
+            out.append(f'<div class="att">&#128206; <a href="{esc(url)}">{esc(fn)}</a></div>')
+        out.append("</div></div>")
+    out.append("</body></html>")
+    return "\n".join(out)
+
+
 async def close_ticket_with_transcript(channel: discord.TextChannel, closer: discord.abc.User):
     guild = channel.guild
     ticket_key = _ticket_key_from_name(channel.name)
     cfg = TICKET_TYPES.get(ticket_key)
-    log_channel_name = cfg["log_channel"] if cfg else "ticket-logs"
-    log_channel = discord.utils.get(guild.text_channels, name=log_channel_name) or discord.utils.get(
-        guild.text_channels, name="ticket-logs"
-    )
 
-    lines = []
-    async for msg in channel.history(limit=500, oldest_first=True):
-        stamp = msg.created_at.strftime("%Y-%m-%d %H:%M")
-        content = msg.content or (f"[attachment: {msg.attachments[0].filename}]" if msg.attachments else "[embed]")
-        lines.append(f"[{stamp}] {msg.author}: {content}")
-    transcript_text = "\n".join(lines) if lines else "No messages were sent in this ticket."
+    log_channel = None
+    for log_name in ((cfg["log_channel"],) if cfg else ()) + ("ticket-logs",):
+        log_channel = find_text_channel(guild, log_name)
+        if log_channel:
+            break
 
+    t = await build_transcript(channel)
+    slug = re.sub(r"[^a-z0-9_-]+", "-", channel.name.lower()).strip("-") or "ticket"
+
+    def make_files():
+        # discord.File can only be sent once, so build fresh ones every time
+        return [
+            discord.File(io.BytesIO(t["html"].encode("utf-8")), filename=f"{slug}-transcript.html"),
+            discord.File(io.BytesIO(t["txt"].encode("utf-8")), filename=f"{slug}-transcript.txt"),
+        ]
+
+    embed = discord.Embed(title="Ticket closed", color=discord.Color.dark_grey())
+    embed.add_field(name="Type", value=cfg["label"] if cfg else "Unknown", inline=True)
+    embed.add_field(name="Opened by", value=f"<@{t['opener_id']}>" if t["opener_id"] else "Unknown", inline=True)
+    embed.add_field(name="Claimed by", value=f"<@{t['claimed_id']}>" if t["claimed_id"] else "Nobody", inline=True)
+    embed.add_field(name="Closed by", value=closer.mention, inline=True)
+    embed.add_field(name="Messages", value=str(t["count"]), inline=True)
+    if t["first_at"]:
+        embed.add_field(name="Opened", value=discord.utils.format_dt(t["first_at"], "f"), inline=True)
+    embed.set_footer(text=f"#{channel.name}")
+    embed.timestamp = discord.utils.utcnow()
+
+    saved_to = None
     if log_channel:
-        transcript_file = discord.File(io.BytesIO(transcript_text.encode()), filename=f"{channel.name}-transcript.txt")
-        embed = discord.Embed(title="Ticket closed", color=discord.Color.dark_grey())
-        embed.add_field(name="Type", value=cfg["label"] if cfg else "Unknown", inline=True)
-        embed.add_field(name="Channel", value=f"#{channel.name}", inline=True)
-        embed.add_field(name="Closed by", value=closer.mention, inline=True)
-        await log_channel.send(embed=embed, file=transcript_file)
+        try:
+            await log_channel.send(embed=embed, files=make_files())
+            saved_to = log_channel.mention
+        except discord.HTTPException as e:
+            print(f"Ticket transcript: couldn't post to #{log_channel.name}: {e!r}")
+    if saved_to is None:
+        # no usable log channel — send it to whoever closed the ticket instead of losing it
+        try:
+            await closer.send(
+                f"I couldn't find a ticket log channel in **{guild.name}**, so here's the transcript.",
+                embed=embed,
+                files=make_files(),
+            )
+            saved_to = "your DMs"
+        except discord.HTTPException:
+            pass
 
-    await channel.send("This ticket will be deleted in 5 seconds.")
+    if TICKET_DM_TRANSCRIPT and t["opener_id"] and t["opener_id"] != closer.id:
+        opener = guild.get_member(t["opener_id"])
+        if opener:
+            try:
+                await opener.send(f"Here's the transcript of your ticket in **{guild.name}**.", files=make_files())
+            except discord.HTTPException:
+                pass
+
+    if saved_to is None:
+        # nowhere to put it — keep the ticket open rather than deleting the only copy
+        try:
+            await channel.send(
+                "⚠️ I couldn't save the transcript (no ticket log channel found and I couldn't DM you), "
+                "so I'm leaving this ticket open. Run `/setup_server` to create the log channels, then close it again.",
+                files=make_files(),
+            )
+        except discord.HTTPException:
+            await channel.send("⚠️ I couldn't save the transcript, so I'm leaving this ticket open.")
+        return
+
+    await channel.send(f"Transcript saved to {saved_to}. This ticket will be deleted in 5 seconds.")
     await asyncio.sleep(5)
     try:
         await channel.delete(reason=f"Ticket closed by {closer}")
