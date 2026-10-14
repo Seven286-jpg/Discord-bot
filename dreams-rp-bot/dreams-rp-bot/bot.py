@@ -86,6 +86,9 @@ TICKET_CATEGORY_PLACEMENT = os.getenv("TICKET_CATEGORY_PLACEMENT", "top")
 TICKET_NEWEST_FIRST = os.getenv("TICKET_NEWEST_FIRST", "true").lower() == "true"
 # Also DM the person who opened the ticket a copy of the transcript when it closes.
 TICKET_DM_TRANSCRIPT = os.getenv("TICKET_DM_TRANSCRIPT", "false").lower() == "true"
+# Category that holds the per-ticket-type transcript log channels. Point this at an existing
+# category (e.g. "Ticket Transcript") to use it. If it doesn't exist the bot creates it (staff-only).
+TICKET_LOG_CATEGORY = os.getenv("TICKET_LOG_CATEGORY", "🎫 Ticket Logs")
 
 # Live FiveM server status embed (posted/updated in STATUS_CHANNEL_NAME).
 # Leave FIVEM_SERVER_IP blank to disable this feature entirely.
@@ -313,7 +316,7 @@ SERVER_STRUCTURE = {
     "📊 Server Stats": [
         ("Members: 0", "voice"),
     ],
-    "🎫 Ticket Logs": [
+    TICKET_LOG_CATEGORY: [
         ("ticket-logs", "text"),
         ("ban-ticket-logs", "text"),
         ("female-verify-logs", "text"),
@@ -327,7 +330,7 @@ SERVER_STRUCTURE = {
 # NOTE: this only applies when /setup_server CREATES the category — if it already exists
 # (e.g. your real "Staff" or "Female Verification" categories), its existing permissions
 # are left exactly as they are; nothing here retroactively changes them.
-LOCKED_CATEGORIES = {"Female Verification", "🎫 Ticket Logs"}
+LOCKED_CATEGORIES = {"Female Verification", TICKET_LOG_CATEGORY}
 
 # ----------------------------------------------------------------------
 # TICKET TYPES
@@ -612,6 +615,62 @@ def find_text_channel(guild: discord.Guild, name: str):
     return None
 
 
+def _ticket_log_override(guild: discord.Guild, key):
+    """A channel ID or name set in Railway always wins over name matching:
+    TICKET_LOG_<TYPE> (e.g. TICKET_LOG_BAN) for one type, or TICKET_LOG_CHANNEL for all of them."""
+    for var in ((f"TICKET_LOG_{key.upper()}",) if key else ()) + ("TICKET_LOG_CHANNEL",):
+        value = os.getenv(var, "").strip()
+        if not value:
+            continue
+        if value.isdigit():
+            ch = guild.get_channel(int(value))
+            if isinstance(ch, discord.TextChannel):
+                return ch
+        else:
+            ch = find_text_channel(guild, value)
+            if ch:
+                return ch
+    return None
+
+
+def find_ticket_log_channel(guild: discord.Guild, cfg, key=None):
+    """The existing channel this ticket type's transcript should go to, or None if there isn't one."""
+    ch = _ticket_log_override(guild, key)
+    if ch:
+        return ch
+    for name in ((cfg["log_channel"],) if cfg else ()) + ("ticket-logs",):
+        ch = find_text_channel(guild, name)
+        if ch:
+            return ch
+    return None
+
+
+async def get_ticket_log_channel(guild: discord.Guild, cfg, key=None):
+    """Finds this ticket type's transcript channel, or creates it (staff-only) if it's missing,
+    so a transcript always lands in the server instead of being DM'd to someone."""
+    wanted = cfg["log_channel"] if cfg else "ticket-logs"
+    ch = find_ticket_log_channel(guild, cfg, key)
+    if ch:
+        return ch
+    staff_role = discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, attach_files=True, embed_links=True
+        ),
+    }
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    try:
+        category = await get_or_create_category(guild, TICKET_LOG_CATEGORY, staff_role)
+        ch = await guild.create_text_channel(wanted, category=category, overwrites=overwrites)
+        print(f"Ticket transcript: created #{ch.name} in '{category.name}'")
+        return ch
+    except discord.HTTPException as e:
+        print(f"Ticket transcript: couldn't create the log channel #{wanted}: {e!r}")
+        return None
+
+
 def _resolve_mentions(guild: discord.Guild, text: str) -> str:
     def repl(m):
         member = guild.get_member(int(m.group(1)))
@@ -708,11 +767,7 @@ async def close_ticket_with_transcript(channel: discord.TextChannel, closer: dis
     ticket_key = _ticket_key_from_name(channel.name)
     cfg = TICKET_TYPES.get(ticket_key)
 
-    log_channel = None
-    for log_name in ((cfg["log_channel"],) if cfg else ()) + ("ticket-logs",):
-        log_channel = find_text_channel(guild, log_name)
-        if log_channel:
-            break
+    log_channel = await get_ticket_log_channel(guild, cfg, ticket_key)
 
     t = await build_transcript(channel)
     slug = re.sub(r"[^a-z0-9_-]+", "-", channel.name.lower()).strip("-") or "ticket"
@@ -736,17 +791,19 @@ async def close_ticket_with_transcript(channel: discord.TextChannel, closer: dis
     embed.timestamp = discord.utils.utcnow()
 
     saved_to = None
+    why = "I couldn't find a ticket log channel or create one"
     if log_channel:
         try:
             await log_channel.send(embed=embed, files=make_files())
             saved_to = log_channel.mention
         except discord.HTTPException as e:
+            why = f"I couldn't post in {log_channel.mention} ({getattr(e, 'text', None) or e})"
             print(f"Ticket transcript: couldn't post to #{log_channel.name}: {e!r}")
     if saved_to is None:
         # no usable log channel — send it to whoever closed the ticket instead of losing it
         try:
             await closer.send(
-                f"I couldn't find a ticket log channel in **{guild.name}**, so here's the transcript.",
+                f"{why}, so here's the transcript for **{guild.name}**.",
                 embed=embed,
                 files=make_files(),
             )
@@ -766,8 +823,8 @@ async def close_ticket_with_transcript(channel: discord.TextChannel, closer: dis
         # nowhere to put it — keep the ticket open rather than deleting the only copy
         try:
             await channel.send(
-                "⚠️ I couldn't save the transcript (no ticket log channel found and I couldn't DM you), "
-                "so I'm leaving this ticket open. Run `/setup_server` to create the log channels, then close it again.",
+                f"⚠️ I couldn't save the transcript ({why}, and I couldn't DM you), "
+                "so I'm leaving this ticket open. Run `/ticket-logs` to see where each transcript goes, then close it again.",
                 files=make_files(),
             )
         except discord.HTTPException:
@@ -821,7 +878,7 @@ async def ticket_categories_cmd(interaction: discord.Interaction, above: discord
             created.append(cat.name)
         cats.append(cat)
     last = await arrange_categories(guild, cats, above=above)
-    logs_cat = find_category(guild, "🎫 Ticket Logs")
+    logs_cat = find_category(guild, TICKET_LOG_CATEGORY)
     if last is not None and logs_cat is not None and logs_cat.id not in {c.id for c in cats}:
         try:
             await logs_cat.move(after=last)
@@ -834,6 +891,27 @@ async def ticket_categories_cmd(interaction: discord.Interaction, above: discord
         + f" and moved all {len(cats)} {where}.",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="ticket-logs", description="Show which channel each ticket type's transcript will be posted to")
+@app_commands.checks.has_permissions(administrator=True)
+async def ticket_logs_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    lines = []
+    for key, cfg in TICKET_TYPES.items():
+        ch = find_ticket_log_channel(guild, cfg, key)
+        if ch is None:
+            lines.append(f"{cfg['emoji']} **{cfg['label']}** → none found, I'll create #{cfg['log_channel']} in **{TICKET_LOG_CATEGORY}**")
+            continue
+        perms = ch.permissions_for(guild.me)
+        missing = [n for n, ok in (("Send Messages", perms.send_messages), ("Attach Files", perms.attach_files), ("Embed Links", perms.embed_links)) if not ok]
+        status = "✅" if not missing else f"⚠️ I'm missing: {', '.join(missing)}"
+        lines.append(f"{cfg['emoji']} **{cfg['label']}** → {ch.mention} (ID `{ch.id}`) {status}")
+    lines.append(
+        "\nTo send a type somewhere else, add a Railway variable named like `TICKET_LOG_BAN` "
+        "(or `TICKET_LOG_CHANNEL` for all of them) set to that channel's ID."
+    )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 # ----------------------------------------------------------------------
