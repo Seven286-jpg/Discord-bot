@@ -42,6 +42,7 @@ Requires: discord.py >= 2.4, Python 3.10+
 import os
 import io
 import re
+import csv
 import html
 import json
 import random
@@ -52,6 +53,7 @@ import urllib.parse
 import socket
 import ipaddress
 from collections import defaultdict, deque
+from zoneinfo import ZoneInfo, available_timezones
 import discord
 import aiohttp
 from discord import app_commands
@@ -1954,6 +1956,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
+    await clock_member_left(member)
     log_channel = get_server_log_channel(member.guild)
     if not log_channel:
         return
@@ -2166,8 +2169,720 @@ async def on_webhooks_update(channel: discord.abc.GuildChannel):
 
 
 # ----------------------------------------------------------------------
+# CLOCK IN / CLOCK OUT
+# Staff clock in/out with buttons or /clock in|out, plus a live "Staff Time Board" that stays at
+# the bottom of the clock channel, weekly totals (Monday 00:00 in each person's timezone, set
+# with /clock timezone), /clock adjust to fix mistakes and /clock clear to reset everyone's time
+# (it saves a CSV of the old totals first). There is NO auto clock-out: people stay clocked in
+# until they clock out (or an admin uses /clock force-out).
+# Data lives in DATA_DIR/clock.json AND is backed up to a hidden #clock-backup channel, so it
+# survives Railway redeploys even without a volume.
+# ----------------------------------------------------------------------
+CLOCK_CHANNEL_NAME = os.getenv("CLOCK_CHANNEL_NAME", "clockin-clockout")
+CLOCK_ROLE_NAMES = {r.strip() for r in os.getenv("CLOCK_ROLE_NAMES", "").split(",") if r.strip()}
+CLOCK_BOARD_MAX_ROWS = int(os.getenv("CLOCK_BOARD_MAX_ROWS", "40"))
+CLOCK_MAX_SESSIONS = int(os.getenv("CLOCK_MAX_SESSIONS", "200"))  # sessions kept per person
+CLOCK_BACKUP_CHANNEL_NAME = os.getenv("CLOCK_BACKUP_CHANNEL_NAME", "clock-backup")
+CLOCK_DEFAULT_TZ = os.getenv("CLOCK_DEFAULT_TZ", "UTC")  # used for anyone who hasn't set /clock timezone
+CLOCK_FILE = os.path.join(DATA_DIR, "clock.json")
+_BACKUP_MARK = "CLOCK_BACKUP_V1"
+
+
+def _clock_read_file():
+    data = _load(CLOCK_FILE)
+    if isinstance(data, dict) and isinstance(data.get("guilds"), dict):
+        return data
+    return {"guilds": {}}
+
+
+_clock = _clock_read_file()
+_clock_backup_dirty = set()
+_clock_restored = False
+_clock_tick = 0
+_board_tasks = {}
+
+
+def _clock_write_file():
+    tmp = CLOCK_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_clock, f)
+    os.replace(tmp, CLOCK_FILE)
+
+
+def _clock_touch(guild_id):
+    _clock_write_file()
+    _clock_backup_dirty.add(int(guild_id))
+
+
+def _g(guild_id):
+    return _clock["guilds"].setdefault(str(guild_id), {"users": {}, "board": None, "cleared_at": None})
+
+
+def _u(guild_id, user_id, name=None):
+    users = _g(guild_id)["users"]
+    u = users.setdefault(
+        str(user_id),
+        {"total": 0, "active": None, "sessions": [], "adjustments": [], "name": name or str(user_id)},
+    )
+    if name:
+        u["name"] = name
+    return u
+
+
+def fmt_duration(seconds):
+    seconds = int(max(0, seconds))
+    if seconds == 0:
+        return "0m"
+    if seconds < 60:
+        return "<1m"
+    h, rem = divmod(seconds, 3600)
+    m = rem // 60
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def _do_clock_in(guild_id, user_id, name, now):
+    u = _u(guild_id, user_id, name)
+    if u["active"] is not None:
+        return False, u["active"]
+    u["active"] = now
+    return True, now
+
+
+def _do_clock_out(guild_id, user_id, name, now, cap=None):
+    u = _u(guild_id, user_id, name)
+    if u["active"] is None:
+        return None
+    start = u["active"]
+    end = now
+    if cap is not None and end - start > cap:
+        end = start + cap
+    duration = max(0, int(end - start))
+    u["total"] += duration
+    u["sessions"].append([int(start), int(end)])
+    u["sessions"] = u["sessions"][-CLOCK_MAX_SESSIONS:]
+    u["active"] = None
+    return duration, u["total"]
+
+
+def _live_total(u, now):
+    return u["total"] + (max(0, now - u["active"]) if u["active"] is not None else 0)
+
+
+def _week_start(u, now):
+    """Monday 00:00 in this person's timezone (falls back to CLOCK_DEFAULT_TZ, then UTC)."""
+    try:
+        tz = ZoneInfo(u.get("tz") or CLOCK_DEFAULT_TZ)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    dt = datetime.datetime.fromtimestamp(now, tz)
+    monday = (dt - datetime.timedelta(days=dt.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return monday.timestamp()
+
+
+def _week_seconds(u, now):
+    """Time worked this week (resets Monday 00:00 in the person's own timezone)."""
+    window_start = _week_start(u, now)
+    total = 0
+    for s_, e_ in u["sessions"]:
+        total += max(0, min(e_, now) - max(s_, window_start))
+    if u["active"] is not None:
+        total += max(0, now - max(u["active"], window_start))
+    return int(total)
+
+
+def _board_rows(guild_id, now):
+    rows = []
+    for uid, u in _g(guild_id)["users"].items():
+        live = _live_total(u, now)
+        active = u["active"] is not None
+        if live <= 0 and not active:
+            continue
+        rows.append(
+            {"uid": uid, "name": u.get("name", uid), "live": live, "week": _week_seconds(u, now), "active": active}
+        )
+    rows.sort(key=lambda r: r["live"], reverse=True)
+    return rows
+
+
+def _do_clear(guild_id, user_id, now):
+    """Zero the logged time (one person, or everyone if user_id is None). Anyone who is on the
+    clock keeps their session but it restarts from now. Returns [(name, uid, seconds_before)]."""
+    g = _g(guild_id)
+    keys = [str(user_id)] if user_id is not None else list(g["users"].keys())
+    snapshot = []
+    for key in keys:
+        u = g["users"].get(key)
+        if not u:
+            continue
+        before = _live_total(u, now)
+        if before > 0:
+            snapshot.append((u.get("name", key), key, before))
+        u["total"] = 0
+        u["sessions"] = []
+        u["adjustments"] = []
+        if u["active"] is not None:
+            u["active"] = now
+    if user_id is None:
+        g["cleared_at"] = now
+    return snapshot
+
+
+def _do_adjust(guild_id, user_id, name, delta_seconds, by, reason, now):
+    u = _u(guild_id, user_id, name)
+    u["total"] = max(0, u["total"] + int(delta_seconds))
+    u["adjustments"].append({"t": int(now), "by": by, "delta": int(delta_seconds), "reason": reason[:100]})
+    u["adjustments"] = u["adjustments"][-30:]
+    return u["total"]
+
+
+def _clock_csv(rows):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["name", "user_id", "total_hours", "total_seconds"])
+    for name, uid, secs in rows:
+        w.writerow([name, uid, round(secs / 3600, 2), int(secs)])
+    return buf.getvalue()
+
+
+def _clock_channel(guild):
+    b = _g(guild.id).get("board")
+    if b:
+        ch = guild.get_channel(b["channel_id"])
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    return find_text_channel(guild, CLOCK_CHANNEL_NAME)
+
+
+def clock_allowed(member):
+    if member.guild_permissions.manage_guild:
+        return True
+    if CLOCK_ROLE_NAMES:
+        return any(r.name in CLOCK_ROLE_NAMES for r in member.roles)
+    if is_staff(member):
+        return True
+    ch = _clock_channel(member.guild)
+    return bool(ch and ch.permissions_for(member).view_channel)
+
+
+def build_board_embed(guild, now=None):
+    now = now or time.time()
+    rows = _board_rows(guild.id, now)
+    g = _g(guild.id)
+    medals = ("🥇", "🥈", "🥉")
+    lines = []
+    for i, r in enumerate(rows[:CLOCK_BOARD_MAX_ROWS], 1):
+        member = guild.get_member(int(r["uid"]))
+        who = member.mention if member else f"**{r['name']}**"
+        rank = medals[i - 1] if i <= 3 else f"`{i}.`"
+        dot = " 🟢" if r["active"] else ""
+        lines.append(f"{rank} {who} — **{fmt_duration(r['live'])}** · wk {fmt_duration(r['week'])}{dot}")
+    if len(rows) > CLOCK_BOARD_MAX_ROWS:
+        lines.append(f"…and {len(rows) - CLOCK_BOARD_MAX_ROWS} more")
+    body = "\n".join(lines) if lines else "No time logged yet. Hit **Clock In** to get on the board!"
+    if g.get("cleared_at"):
+        body += f"\n\n*Time last cleared <t:{int(g['cleared_at'])}:R>*"
+    embed = discord.Embed(title="🕐 Staff Time Board", description=body, color=discord.Color.green())
+    on_clock = sum(1 for r in rows if r["active"])
+    embed.set_footer(
+        text=f"{on_clock} on the clock · {fmt_duration(sum(r['live'] for r in rows))} total · 🟢 = clocked in now"
+    )
+    embed.timestamp = discord.utils.utcnow()
+    return embed
+
+
+class ClockPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Clock In", emoji="🟢", style=discord.ButtonStyle.green, custom_id="clock_in_btn")
+    async def btn_in(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_clock_in(interaction)
+
+    @discord.ui.button(label="Clock Out", emoji="🔴", style=discord.ButtonStyle.red, custom_id="clock_out_btn")
+    async def btn_out(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_clock_out(interaction)
+
+    @discord.ui.button(label="My Time", emoji="📊", style=discord.ButtonStyle.blurple, custom_id="clock_me_btn")
+    async def btn_me(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_my_time(interaction)
+
+
+async def handle_clock_in(interaction: discord.Interaction):
+    member = interaction.user
+    if not clock_allowed(member):
+        await interaction.response.send_message("You don't have access to the clock-in system.", ephemeral=True)
+        return
+    now = time.time()
+    ok, since = _do_clock_in(interaction.guild_id, member.id, member.display_name, now)
+    if not ok:
+        await interaction.response.send_message(
+            f"You're already clocked in — since <t:{int(since)}:t> (<t:{int(since)}:R>).", ephemeral=True
+        )
+        return
+    _clock_touch(interaction.guild_id)
+    embed = discord.Embed(
+        description=f"🟢 {member.mention} **clocked in** at <t:{int(now)}:t>", color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed)
+    schedule_board_repost(interaction.guild)
+
+
+async def handle_clock_out(interaction: discord.Interaction):
+    member = interaction.user
+    if not clock_allowed(member):
+        await interaction.response.send_message("You don't have access to the clock-in system.", ephemeral=True)
+        return
+    now = time.time()
+    res = _do_clock_out(interaction.guild_id, member.id, member.display_name, now)
+    if res is None:
+        await interaction.response.send_message("You're not clocked in.", ephemeral=True)
+        return
+    duration, total = res
+    _clock_touch(interaction.guild_id)
+    week = _week_seconds(_u(interaction.guild_id, member.id), now)
+    embed = discord.Embed(
+        description=(
+            f"🔴 {member.mention} **clocked out** at <t:{int(now)}:t>\n"
+            f"Session **{fmt_duration(duration)}** · Total **{fmt_duration(total)}** · This week **{fmt_duration(week)}**"
+        ),
+        color=discord.Color.red(),
+    )
+    await interaction.response.send_message(embed=embed)
+    schedule_board_repost(interaction.guild)
+
+
+async def handle_my_time(interaction: discord.Interaction):
+    member = interaction.user
+    if not clock_allowed(member):
+        await interaction.response.send_message("You don't have access to the clock-in system.", ephemeral=True)
+        return
+    now = time.time()
+    u = _g(interaction.guild_id)["users"].get(str(member.id))
+    if not u:
+        await interaction.response.send_message("You haven't logged any time yet.", ephemeral=True)
+        return
+    rows = _board_rows(interaction.guild_id, now)
+    rank = next((i for i, r in enumerate(rows, 1) if r["uid"] == str(member.id)), None)
+    embed = discord.Embed(title="📊 Your time", color=discord.Color.blurple())
+    if u["active"] is not None:
+        embed.add_field(
+            name="Status",
+            value=f"🟢 On the clock since <t:{int(u['active'])}:t> ({fmt_duration(now - u['active'])} so far)",
+            inline=False,
+        )
+    else:
+        embed.add_field(name="Status", value="⚫ Clocked out", inline=False)
+    embed.add_field(name="Total", value=fmt_duration(_live_total(u, now)), inline=True)
+    embed.add_field(name="This week", value=fmt_duration(_week_seconds(u, now)), inline=True)
+    embed.add_field(name="Sessions", value=str(len(u["sessions"])), inline=True)
+    embed.add_field(name="Timezone", value=u.get("tz") or f"{CLOCK_DEFAULT_TZ} (default)", inline=True)
+    if rank:
+        embed.set_footer(text=f"Rank #{rank} of {len(rows)} on the board")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def schedule_board_repost(guild):
+    t = _board_tasks.get(guild.id)
+    if t and not t.done():
+        return  # one is already queued; it will read the latest state when it runs
+    _board_tasks[guild.id] = bot.loop.create_task(_delayed_repost(guild))
+
+
+async def _delayed_repost(guild):
+    await asyncio.sleep(2.5)
+    try:
+        await repost_board(guild)
+    except Exception as e:
+        print(f"Clock board repost failed: {e!r}")
+
+
+async def repost_board(guild, channel=None):
+    """Post a fresh board (with the buttons) at the bottom of the channel, then remove the old one."""
+    g = _g(guild.id)
+    old = g.get("board")
+    if channel is None:
+        if not old:
+            return
+        channel = guild.get_channel(old["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            return
+    msg = await channel.send(embed=build_board_embed(guild), view=ClockPanelView())
+    if old:
+        try:
+            old_ch = guild.get_channel(old["channel_id"])
+            if old_ch:
+                await old_ch.get_partial_message(old["message_id"]).delete()
+        except discord.HTTPException:
+            pass
+    g["board"] = {"channel_id": channel.id, "message_id": msg.id}
+    _clock_touch(guild.id)
+
+
+async def refresh_board(guild):
+    """Edit the board in place (keeps live 🟢 times fresh without re-posting)."""
+    b = _g(guild.id).get("board")
+    if not b:
+        return
+    ch = guild.get_channel(b["channel_id"])
+    if not isinstance(ch, discord.TextChannel):
+        return
+    try:
+        await ch.get_partial_message(b["message_id"]).edit(embed=build_board_embed(guild))
+    except discord.NotFound:
+        await repost_board(guild)
+    except discord.HTTPException:
+        pass
+
+
+async def backup_clock(guild):
+    """Keep a copy of this server's clock data in a hidden channel so a redeploy can't wipe it."""
+    g = _clock["guilds"].get(str(guild.id))
+    if g is None:
+        return True
+    ch = find_text_channel(guild, CLOCK_BACKUP_CHANNEL_NAME)
+    if ch is None:
+        clock_ch = _clock_channel(guild)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, attach_files=True, read_message_history=True
+            ),
+        }
+        try:
+            ch = await guild.create_text_channel(
+                CLOCK_BACKUP_CHANNEL_NAME,
+                category=clock_ch.category if clock_ch else None,
+                overwrites=overwrites,
+                topic="Automatic backup of the clock-in data. Only the bot and admins can see this. Don't delete the file message.",
+            )
+        except discord.HTTPException as e:
+            print(f"Clock backup: couldn't create #{CLOCK_BACKUP_CHANNEL_NAME}: {e!r}")
+            return False
+    payload = json.dumps({"v": 1, "guild": g}, separators=(",", ":")).encode("utf-8")
+    content = (
+        f"{_BACKUP_MARK} — last saved <t:{int(time.time())}:f>. "
+        "Don't delete this message; it restores the clock data after a redeploy."
+    )
+    try:
+        existing = None
+        async for m in ch.history(limit=25):
+            if m.author.id == bot.user.id and m.content.startswith(_BACKUP_MARK):
+                existing = m
+                break
+        f = discord.File(io.BytesIO(payload), filename="clock-data.json")
+        if existing:
+            await existing.edit(content=content, attachments=[f])
+        else:
+            await ch.send(content=content, file=f)
+        return True
+    except discord.HTTPException as e:
+        print(f"Clock backup failed: {e!r}")
+        return False
+
+
+async def clock_restore_missing():
+    """After a redeploy wipes the local file, pull the data back from the backup channel."""
+    global _clock_restored
+    if _clock_restored:
+        return
+    _clock_restored = True
+    restored = False
+    for guild in bot.guilds:
+        local = _clock["guilds"].get(str(guild.id))
+        if local and local.get("users"):
+            continue
+        ch = find_text_channel(guild, CLOCK_BACKUP_CHANNEL_NAME)
+        if not ch:
+            continue
+        try:
+            async for m in ch.history(limit=25):
+                if m.author.id == bot.user.id and m.content.startswith(_BACKUP_MARK) and m.attachments:
+                    data = json.loads(await m.attachments[0].read())
+                    g = data["guild"]
+                    g.setdefault("users", {})
+                    g.setdefault("board", None)
+                    g.setdefault("cleared_at", None)
+                    _clock["guilds"][str(guild.id)] = g
+                    restored = True
+                    print(f"Clock: restored {len(g['users'])} people's time from #{ch.name} in {guild.name}")
+                    break
+        except (discord.HTTPException, ValueError, KeyError) as e:
+            print(f"Clock restore failed for {guild.name}: {e!r}")
+    if restored:
+        _clock_write_file()
+
+
+@tasks.loop(seconds=60)
+async def clock_maintenance():
+    # No auto clock-out: this only keeps the board fresh and backs up the data.
+    global _clock_tick
+    _clock_tick += 1
+    try:
+        for guild in bot.guilds:
+            g = _clock["guilds"].get(str(guild.id))
+            if not g:
+                continue
+            if _clock_tick % 5 == 0:
+                await refresh_board(guild)
+        for gid in list(_clock_backup_dirty):
+            _clock_backup_dirty.discard(gid)
+            guild = bot.get_guild(gid)
+            if guild and not await backup_clock(guild):
+                _clock_backup_dirty.add(gid)
+    except Exception as e:
+        print(f"Clock maintenance error: {e!r}")
+
+
+async def clock_member_left(member):
+    try:
+        u = _g(member.guild.id)["users"].get(str(member.id))
+        if not u or u["active"] is None:
+            return
+        res = _do_clock_out(member.guild.id, member.id, member.display_name, time.time())
+        _clock_touch(member.guild.id)
+        ch = _clock_channel(member.guild)
+        if ch and res:
+            await ch.send(
+                embed=discord.Embed(
+                    description=f"🔴 **{member.display_name}** left the server and was clocked out — session **{fmt_duration(res[0])}**.",
+                    color=discord.Color.red(),
+                )
+            )
+        schedule_board_repost(member.guild)
+    except Exception as e:
+        print(f"Clock: member-left handling failed: {e!r}")
+
+
+class ClockClearConfirm(discord.ui.View):
+    def __init__(self, admin_id, member=None):
+        super().__init__(timeout=60)
+        self.admin_id = admin_id
+        self.member = member
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("Only the person who ran this can confirm it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, clear it", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        snapshot = _do_clear(guild.id, self.member.id if self.member else None, time.time())
+        snapshot.sort(key=lambda r: r[2], reverse=True)
+        _clock_touch(guild.id)
+        await interaction.response.edit_message(content="✅ Done — the time has been cleared.", view=None)
+        ch = _clock_channel(guild) or interaction.channel
+        who = self.member.mention if self.member else "**everyone's**"
+        embed = discord.Embed(
+            title="🧹 Time cleared",
+            description=f"{interaction.user.mention} cleared {who} logged time. The totals from before are attached.",
+            color=discord.Color.orange(),
+        )
+        csv_file = discord.File(io.BytesIO(_clock_csv(snapshot).encode("utf-8")), filename="clock-totals-before-clear.csv")
+        try:
+            await ch.send(embed=embed, file=csv_file)
+        except discord.HTTPException as e:
+            print(f"Clock: couldn't post the clear archive: {e!r}")
+        await backup_clock(guild)
+        schedule_board_repost(guild)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled — nothing was changed.", view=None)
+
+
+clock_group = app_commands.Group(name="clock", description="Clock in / clock out time tracking", guild_only=True)
+
+
+@clock_group.command(name="in", description="Clock in")
+async def clock_in_cmd(interaction: discord.Interaction):
+    await handle_clock_in(interaction)
+
+
+@clock_group.command(name="out", description="Clock out")
+async def clock_out_cmd(interaction: discord.Interaction):
+    await handle_clock_out(interaction)
+
+
+@clock_group.command(name="me", description="See your own time (only you can see it)")
+async def clock_me_cmd(interaction: discord.Interaction):
+    await handle_my_time(interaction)
+
+
+@clock_group.command(name="board", description="See everyone's time (only you can see it)")
+async def clock_board_cmd(interaction: discord.Interaction):
+    if not clock_allowed(interaction.user):
+        await interaction.response.send_message("You don't have access to the clock-in system.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=build_board_embed(interaction.guild), ephemeral=True)
+
+
+@clock_group.command(name="panel", description="Post the clock-in buttons + live time board in this channel")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clock_panel_cmd(interaction: discord.Interaction):
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Run this in a normal text channel.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await repost_board(interaction.guild, interaction.channel)
+    await interaction.followup.send(
+        "Posted. The board and buttons stay at the bottom of this channel and update themselves.", ephemeral=True
+    )
+
+
+@clock_group.command(name="history", description="Show a member's recent sessions and adjustments")
+@app_commands.describe(member="Whose history to show")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clock_history_cmd(interaction: discord.Interaction, member: discord.Member):
+    u = _g(interaction.guild_id)["users"].get(str(member.id))
+    if not u or not (u["sessions"] or u["adjustments"] or u["active"] is not None):
+        await interaction.response.send_message(f"{member.mention} has no time logged.", ephemeral=True)
+        return
+    now = time.time()
+    lines = [f"<t:{s}:f> → <t:{e}:t> · **{fmt_duration(e - s)}**" for s, e in u["sessions"][-10:][::-1]]
+    embed = discord.Embed(title=f"Time for {member.display_name}", color=discord.Color.blurple())
+    embed.add_field(name="Total", value=fmt_duration(_live_total(u, now)), inline=True)
+    embed.add_field(name="This week", value=fmt_duration(_week_seconds(u, now)), inline=True)
+    embed.add_field(name="Timezone", value=u.get("tz") or f"{CLOCK_DEFAULT_TZ} (default)", inline=True)
+    if u["active"] is not None:
+        embed.add_field(name="Status", value=f"🟢 clocked in since <t:{int(u['active'])}:t>", inline=True)
+    embed.add_field(name="Last sessions", value="\n".join(lines) or "None", inline=False)
+    adj = [
+        f"<t:{a['t']}:d> {'+' if a['delta'] >= 0 else '-'}{fmt_duration(abs(a['delta']))} by <@{a['by']}> — {a['reason']}"
+        for a in u["adjustments"][-5:][::-1]
+    ]
+    if adj:
+        embed.add_field(name="Adjustments", value="\n".join(adj), inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@clock_group.command(name="adjust", description="Add or remove minutes from someone's total")
+@app_commands.describe(
+    member="Whose total to change",
+    minutes="Minutes to add (use a negative number to remove)",
+    reason="Why you're changing it",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clock_adjust_cmd(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: app_commands.Range[int, -100000, 100000],
+    reason: str = "Manual adjustment",
+):
+    new_total = _do_adjust(
+        interaction.guild_id, member.id, member.display_name, minutes * 60, interaction.user.id, reason, time.time()
+    )
+    _clock_touch(interaction.guild_id)
+    await interaction.response.send_message(
+        f"✏️ {interaction.user.mention} adjusted {member.mention} by **{minutes:+d} min** "
+        f"({reason}). New total: **{fmt_duration(new_total)}**."
+    )
+    schedule_board_repost(interaction.guild)
+
+
+@clock_group.command(name="force-out", description="Clock someone else out (for when they forgot)")
+@app_commands.describe(member="Who to clock out")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clock_force_out_cmd(interaction: discord.Interaction, member: discord.Member):
+    res = _do_clock_out(interaction.guild_id, member.id, member.display_name, time.time())
+    if res is None:
+        await interaction.response.send_message(f"{member.mention} isn't clocked in.", ephemeral=True)
+        return
+    duration, total = res
+    _clock_touch(interaction.guild_id)
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            description=(
+                f"🔴 {interaction.user.mention} clocked {member.mention} out — "
+                f"session **{fmt_duration(duration)}** · Total **{fmt_duration(total)}**"
+            ),
+            color=discord.Color.red(),
+        )
+    )
+    schedule_board_repost(interaction.guild)
+
+
+@clock_group.command(name="clear", description="Clear logged time — everyone, or just one member")
+@app_commands.describe(member="Leave empty to clear everyone's time")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clock_clear_cmd(interaction: discord.Interaction, member: discord.Member = None):
+    now = time.time()
+    users = _g(interaction.guild_id)["users"]
+    if member:
+        u = users.get(str(member.id))
+        total = _live_total(u, now) if u else 0
+        what = f"{member.mention}'s logged time (**{fmt_duration(total)}**)"
+    else:
+        count = sum(1 for u in users.values() if _live_total(u, now) > 0)
+        total = sum(_live_total(u, now) for u in users.values())
+        what = f"**everyone's** logged time ({count} people, **{fmt_duration(total)}** total)"
+    await interaction.response.send_message(
+        f"⚠️ This will reset {what} to zero. Anyone currently clocked in stays clocked in, but their "
+        "session restarts from now. A CSV of the current totals is saved to the channel first.\n\nContinue?",
+        view=ClockClearConfirm(interaction.user.id, member),
+        ephemeral=True,
+    )
+
+
+async def _tz_autocomplete(interaction: discord.Interaction, current: str):
+    cur = current.lower().replace(" ", "_")
+    names = [z for z in sorted(available_timezones()) if cur in z.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in names[:25]]
+
+
+@clock_group.command(name="timezone", description="Set your timezone (e.g. America/Los_Angeles)")
+@app_commands.describe(zone="Timezone name", member="Staff only: set it for someone else")
+@app_commands.autocomplete(zone=_tz_autocomplete)
+async def clock_tz_cmd(interaction: discord.Interaction, zone: str, member: discord.Member = None):
+    target = member or interaction.user
+    if target.id != interaction.user.id and not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("You can only set your own timezone.", ephemeral=True)
+        return
+    if not clock_allowed(interaction.user):
+        await interaction.response.send_message("You don't have access to the clock-in system.", ephemeral=True)
+        return
+    try:
+        ZoneInfo(zone)
+    except Exception:
+        await interaction.response.send_message(
+            "Unknown timezone. Start typing and pick one from the list, like `America/New_York`.",
+            ephemeral=True,
+        )
+        return
+    _u(interaction.guild_id, target.id, target.display_name)["tz"] = zone
+    _clock_touch(interaction.guild_id)
+    await interaction.response.send_message(
+        f"Timezone for {target.mention} set to **{zone}**. Their week now runs Monday 00:00 in that zone.",
+        ephemeral=True,
+    )
+    schedule_board_repost(interaction.guild)
+
+
+bot.tree.add_command(clock_group)
+
+
+# ----------------------------------------------------------------------
 # STARTUP
 # ----------------------------------------------------------------------
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "You don't have permission to use that command."
+    else:
+        print(f"Command error in /{getattr(interaction.command, 'qualified_name', '?')}: {error!r}")
+        msg = "Something went wrong running that command — it's been logged."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 @bot.event
 async def on_ready():
     bot.add_view(TicketPanelView())
@@ -2176,8 +2891,12 @@ async def on_ready():
     bot.add_view(GiveawayView())
     bot.add_view(RulesGateView())
     bot.add_view(SelfRoleView())
+    bot.add_view(ClockPanelView())
     if not giveaway_checker.is_running():
         giveaway_checker.start()
+    await clock_restore_missing()
+    if not clock_maintenance.is_running():
+        clock_maintenance.start()
     if not update_member_count.is_running():
         update_member_count.start()
     if (CFX_JOIN_CODE or FIVEM_SERVER_IP) and not update_server_status.is_running():
