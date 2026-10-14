@@ -2051,12 +2051,41 @@ async def timeout(interaction: discord.Interaction, member: discord.Member, minu
     await interaction.response.send_message(f"Timed out {member.mention} for {minutes} minutes.")
 
 
+ROLE_ALL_BATCH_SIZE = int(os.getenv("ROLE_ALL_BATCH_SIZE", "1500"))  # members handled per /role-all run
+
+
 @bot.tree.command(name="role-all", description="Give a role to every current member (runs in the background)")
 @app_commands.describe(role="Role to give everyone")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def role_all(interaction: discord.Interaction, role: discord.Role):
     guild = interaction.guild
     channel = interaction.channel
+    me = guild.me
+
+    # Pre-checks, so you get a clear reason up front instead of a silent failure
+    if role.is_default() or role.managed:
+        await interaction.response.send_message(
+            "I can't hand out that role (@everyone and bot/integration roles can't be assigned).", ephemeral=True
+        )
+        return
+    if not me.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "I don't have the **Manage Roles** permission. Give my role that permission and try again.", ephemeral=True
+        )
+        return
+    if role >= me.top_role:
+        await interaction.response.send_message(
+            f"{role.mention} is above (or equal to) my highest role, so I can't give it out. "
+            "Go to Server Settings → Roles and drag my bot role **above** it, then run this again.",
+            ephemeral=True,
+        )
+        return
+    if interaction.user.id != guild.owner_id and role >= interaction.user.top_role:
+        await interaction.response.send_message(
+            "You can't give out a role that's above your own highest role.", ephemeral=True
+        )
+        return
+
     await interaction.response.send_message(
         f"Starting — adding {role.mention} to every member. This can take a while on a big server; "
         f"I'll post here when it's done."
@@ -2064,20 +2093,63 @@ async def role_all(interaction: discord.Interaction, role: discord.Role):
 
     async def _run():
         added, skipped, failed = 0, 0, 0
-        async for member in guild.fetch_members(limit=None):
-            if member.bot or role in member.roles:
-                skipped += 1
-                continue
+        last_error = None
+        try:
+            # Prefer the member cache (fast, and filled when the Members intent is on);
+            # fall back to fetching from the API if the cache looks incomplete.
+            members = list(guild.members)
+            if len(members) < max(1, guild.member_count - 5):
+                members = [m async for m in guild.fetch_members(limit=None)]
+            todo = [m for m in members if not m.bot and role not in m.roles]
+            skipped = len(members) - len(todo)
+            remaining = max(0, len(todo) - ROLE_ALL_BATCH_SIZE)
+            todo = todo[:ROLE_ALL_BATCH_SIZE]
+            print(f"/role-all: {len(members)} members seen, {len(todo)} need {role.name}")
+
+            if not members or (len(members) <= 2 and guild.member_count > 2):
+                await channel.send(
+                    "⚠️ /role-all can only see "
+                    f"{len(members)} member(s). Turn on **Server Members Intent** in the Discord Developer Portal "
+                    "(Bot tab → Privileged Gateway Intents), restart the bot, and run it again."
+                )
+                return
+
+            status = await channel.send(f"⏳ Giving {role.mention} to **{len(todo)}** members…")
+            for i, member in enumerate(todo, 1):
+                try:
+                    await member.add_roles(role, reason=f"/role-all by {interaction.user}")
+                    added += 1
+                except discord.HTTPException as e:  # Forbidden is a subclass
+                    failed += 1
+                    last_error = e
+                    print(f"/role-all: couldn't give {role.name} to {member} ({member.id}): {e!r}")
+                if i % 25 == 0:
+                    try:
+                        await status.edit(content=f"⏳ {role.mention}: {added}/{len(todo)} done…")
+                    except discord.HTTPException:
+                        pass
+                await asyncio.sleep(0.35)  # stay well under Discord's rate limits
+
+            msg = (
+                f"✅ /role-all finished — gave {role.mention} to **{added}** members "
+                f"({skipped} already had it or are bots, {failed} failed)."
+            )
+            if remaining:
+                msg += (
+                    f"\n**{remaining}** members still need it. Run `/role-all` again to do the next "
+                    f"{min(remaining, ROLE_ALL_BATCH_SIZE)}."
+                )
+            if failed and last_error is not None:
+                msg += f"\nLast error: `{getattr(last_error, 'text', None) or last_error}`"
+            await channel.send(msg)
+        except Exception as e:
+            print(f"/role-all crashed: {e!r}")
             try:
-                await member.add_roles(role, reason=f"/role-all by {interaction.user}")
-                added += 1
-            except discord.Forbidden:
-                failed += 1
-            await asyncio.sleep(0.35)  # stay well under Discord's rate limits
-        await channel.send(
-            f"✅ /role-all finished — gave {role.mention} to **{added}** members "
-            f"({skipped} already had it, {failed} failed due to missing permissions)."
-        )
+                await channel.send(
+                    f"⚠️ /role-all stopped early after giving {role.mention} to **{added}** members: `{e!r}`."
+                )
+            except discord.HTTPException:
+                pass
 
     bot.loop.create_task(_run())
 
