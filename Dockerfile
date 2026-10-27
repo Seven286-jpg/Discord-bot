@@ -6,8 +6,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
+COPY dreams-rp-bot/dreams-rp-bot/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+COPY dreams-rp-bot/dreams-rp-bot/ .
 
 CMD ["python", "bot.py"]
