@@ -53,7 +53,6 @@ import urllib.parse
 import socket
 import ipaddress
 from collections import defaultdict, deque
-from zoneinfo import ZoneInfo, available_timezones
 import discord
 import aiohttp
 from discord import app_commands
@@ -325,6 +324,8 @@ SERVER_STRUCTURE = {
         ("city-report-logs", "text"),
         ("reimburse-logs", "text"),
         ("higher-ups-logs", "text"),
+        ("ac-ban-ticket-logs", "text"),
+        ("import-ticket-logs", "text"),
     ],
 }
 
@@ -347,6 +348,16 @@ TICKET_TYPES = {
     "city_report": {"label": "City Report Ticket", "emoji": "🏙️", "category": "City Report Ticket", "log_channel": "city-report-logs"},
     "reimburse": {"label": "Reimburse Ticket", "emoji": "💸", "category": "Reimburse Ticket", "log_channel": "reimburse-logs"},
     "higher_ups": {"label": "Higher Ups", "emoji": "👑", "category": "Higher Ups", "log_channel": "higher-ups-logs"},
+    # "intro" is optional text shown inside the ticket telling the person what to include.
+    "ac_ban": {
+        "label": "AC Ban Ticket", "emoji": "🛡️", "category": "AC Ban Ticket", "log_channel": "ac-ban-ticket-logs",
+        "intro": "Please tell us your in-game name, the ban reason you were shown, and anything that explains "
+                 "what happened. Staff will review your appeal.",
+    },
+    "import": {
+        "label": "Import Ticket", "emoji": "📦", "category": "Import Ticket", "log_channel": "import-ticket-logs",
+        "intro": "Please tell us what you'd like imported and include any proof or screenshots. Staff will take a look.",
+    },
 }
 
 
@@ -572,7 +583,10 @@ async def open_ticket(interaction: discord.Interaction, ticket_key: str):
 
     embed = discord.Embed(
         title=cfg["label"],
-        description=f"{interaction.user.mention} thanks for opening a **{cfg['label']}**. Staff will be with you shortly.",
+        description=(
+            f"{interaction.user.mention} thanks for opening a **{cfg['label']}**. Staff will be with you shortly."
+            + (f"\n\n{cfg['intro']}" if cfg.get("intro") else "")
+        ),
         color=discord.Color.blurple(),
     )
     await ticket_channel.send(embed=embed, view=TicketControlView())
@@ -845,9 +859,13 @@ async def post_ticket_panel(guild: discord.Guild, channel: discord.TextChannel =
     ticket_hub = channel or discord.utils.get(guild.text_channels, name="ticket-hub")
     if not ticket_hub:
         return
-    # avoid duplicate panels
-    async for msg in ticket_hub.history(limit=20):
+    # an existing panel is updated in place (so new ticket types show up) instead of posting a duplicate
+    async for msg in ticket_hub.history(limit=50):
         if msg.author == guild.me and msg.embeds and msg.embeds[0].title == "Need Help?":
+            try:
+                await msg.edit(view=TicketPanelView())
+            except discord.HTTPException as e:
+                print(f"Couldn't refresh the ticket panel: {e!r}")
             return
     embed = discord.Embed(
         title="Need Help?",
@@ -862,7 +880,7 @@ async def post_ticket_panel(guild: discord.Guild, channel: discord.TextChannel =
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ticket_panel_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
     await post_ticket_panel(interaction.guild, channel or interaction.channel)
-    await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
+    await interaction.response.send_message("Ticket panel is up to date — the dropdown lists every ticket type.", ephemeral=True)
 
 
 @bot.tree.command(name="ticket-categories", description="Create missing ticket categories and move them all into place")
@@ -1887,6 +1905,8 @@ async def on_message(message: discord.Message):
     if await run_automod(message):
         return
 
+    await handle_wl_message(message)
+
     if message.channel.name == "suggestions":
         await message.add_reaction("👍")
         await message.add_reaction("👎")
@@ -2051,107 +2071,74 @@ async def timeout(interaction: discord.Interaction, member: discord.Member, minu
     await interaction.response.send_message(f"Timed out {member.mention} for {minutes} minutes.")
 
 
-ROLE_ALL_BATCH_SIZE = int(os.getenv("ROLE_ALL_BATCH_SIZE", "1500"))  # members handled per /role-all run
+async def _run_role_all(interaction: discord.Interaction, role: discord.Role):
+    guild = interaction.guild
+    channel = interaction.channel
+    # The usual reason this "does nothing": Discord only lets me give roles that sit BELOW my own
+    # highest role (even with Administrator), so check that up front and say so.
+    if role.is_default():
+        await interaction.response.send_message(
+            "Everyone already has @everyone — pick a different role.", ephemeral=True
+        )
+        return
+    if role.managed:
+        await interaction.response.send_message(
+            f"{role.mention} is managed by a bot or integration, so it can't be handed out manually.", ephemeral=True
+        )
+        return
+    if role >= guild.me.top_role:
+        await interaction.response.send_message(
+            f"I can't give out {role.mention} because it's above (or level with) my highest role. "
+            "Go to **Server Settings → Roles**, drag my role above it, then run this again.",
+            ephemeral=True,
+        )
+        return
+    minutes = max(1, round(guild.member_count * 0.35 / 60))
+    await interaction.response.send_message(
+        f"Starting — adding {role.mention} to every member. That's roughly {minutes} min for "
+        f"{guild.member_count} members; I'll post here when it's done."
+    )
+
+    async def _run():
+        added = skipped = failed = 0
+        try:
+            async for member in guild.fetch_members(limit=None):
+                if member.bot or role in member.roles:
+                    skipped += 1
+                    continue
+                try:
+                    await member.add_roles(role, reason=f"/role-all by {interaction.user}")
+                    added += 1
+                except discord.HTTPException:
+                    failed += 1
+                await asyncio.sleep(0.35)  # stay well under Discord's rate limits
+        except Exception as e:
+            print(f"/role-all stopped early: {e!r}")
+            await channel.send(f"⚠️ /role-all stopped early ({e}). Gave {role.mention} to {added} members before that.")
+            return
+        note = (
+            " The ones I couldn't change usually have a role above mine (like admins or the owner)." if failed else ""
+        )
+        await channel.send(
+            f"✅ /role-all finished — gave {role.mention} to **{added}** members "
+            f"({skipped} already had it or are bots, {failed} couldn't be changed).{note}"
+        )
+
+    bot.loop.create_task(_run())
 
 
 @bot.tree.command(name="role-all", description="Give a role to every current member (runs in the background)")
 @app_commands.describe(role="Role to give everyone")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def role_all(interaction: discord.Interaction, role: discord.Role):
-    guild = interaction.guild
-    channel = interaction.channel
-    me = guild.me
+    await _run_role_all(interaction, role)
 
-    # Pre-checks, so you get a clear reason up front instead of a silent failure
-    if role.is_default() or role.managed:
-        await interaction.response.send_message(
-            "I can't hand out that role (@everyone and bot/integration roles can't be assigned).", ephemeral=True
-        )
-        return
-    if not me.guild_permissions.manage_roles:
-        await interaction.response.send_message(
-            "I don't have the **Manage Roles** permission. Give my role that permission and try again.", ephemeral=True
-        )
-        return
-    if role >= me.top_role:
-        await interaction.response.send_message(
-            f"{role.mention} is above (or equal to) my highest role, so I can't give it out. "
-            "Go to Server Settings → Roles and drag my bot role **above** it, then run this again.",
-            ephemeral=True,
-        )
-        return
-    if interaction.user.id != guild.owner_id and role >= interaction.user.top_role:
-        await interaction.response.send_message(
-            "You can't give out a role that's above your own highest role.", ephemeral=True
-        )
-        return
 
-    await interaction.response.send_message(
-        f"Starting — adding {role.mention} to every member. This can take a while on a big server; "
-        f"I'll post here when it's done."
-    )
-
-    async def _run():
-        added, skipped, failed = 0, 0, 0
-        last_error = None
-        try:
-            # Prefer the member cache (fast, and filled when the Members intent is on);
-            # fall back to fetching from the API if the cache looks incomplete.
-            members = list(guild.members)
-            if len(members) < max(1, guild.member_count - 5):
-                members = [m async for m in guild.fetch_members(limit=None)]
-            todo = [m for m in members if not m.bot and role not in m.roles]
-            skipped = len(members) - len(todo)
-            remaining = max(0, len(todo) - ROLE_ALL_BATCH_SIZE)
-            todo = todo[:ROLE_ALL_BATCH_SIZE]
-            print(f"/role-all: {len(members)} members seen, {len(todo)} need {role.name}")
-
-            if not members or (len(members) <= 2 and guild.member_count > 2):
-                await channel.send(
-                    "⚠️ /role-all can only see "
-                    f"{len(members)} member(s). Turn on **Server Members Intent** in the Discord Developer Portal "
-                    "(Bot tab → Privileged Gateway Intents), restart the bot, and run it again."
-                )
-                return
-
-            status = await channel.send(f"⏳ Giving {role.mention} to **{len(todo)}** members…")
-            for i, member in enumerate(todo, 1):
-                try:
-                    await member.add_roles(role, reason=f"/role-all by {interaction.user}")
-                    added += 1
-                except discord.HTTPException as e:  # Forbidden is a subclass
-                    failed += 1
-                    last_error = e
-                    print(f"/role-all: couldn't give {role.name} to {member} ({member.id}): {e!r}")
-                if i % 25 == 0:
-                    try:
-                        await status.edit(content=f"⏳ {role.mention}: {added}/{len(todo)} done…")
-                    except discord.HTTPException:
-                        pass
-                await asyncio.sleep(0.35)  # stay well under Discord's rate limits
-
-            msg = (
-                f"✅ /role-all finished — gave {role.mention} to **{added}** members "
-                f"({skipped} already had it or are bots, {failed} failed)."
-            )
-            if remaining:
-                msg += (
-                    f"\n**{remaining}** members still need it. Run `/role-all` again to do the next "
-                    f"{min(remaining, ROLE_ALL_BATCH_SIZE)}."
-                )
-            if failed and last_error is not None:
-                msg += f"\nLast error: `{getattr(last_error, 'text', None) or last_error}`"
-            await channel.send(msg)
-        except Exception as e:
-            print(f"/role-all crashed: {e!r}")
-            try:
-                await channel.send(
-                    f"⚠️ /role-all stopped early after giving {role.mention} to **{added}** members: `{e!r}`."
-                )
-            except discord.HTTPException:
-                pass
-
-    bot.loop.create_task(_run())
+@bot.tree.command(name="roleall", description="Same as /role-all: give a role to every current member")
+@app_commands.describe(role="Role to give everyone")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def roleall_alias(interaction: discord.Interaction, role: discord.Role):
+    await _run_role_all(interaction, role)
 
 
 # ----------------------------------------------------------------------
@@ -2243,19 +2230,17 @@ async def on_webhooks_update(channel: discord.abc.GuildChannel):
 # ----------------------------------------------------------------------
 # CLOCK IN / CLOCK OUT
 # Staff clock in/out with buttons or /clock in|out, plus a live "Staff Time Board" that stays at
-# the bottom of the clock channel, weekly totals (Monday 00:00 in each person's timezone, set
-# with /clock timezone), /clock adjust to fix mistakes and /clock clear to reset everyone's time
-# (it saves a CSV of the old totals first). There is NO auto clock-out: people stay clocked in
-# until they clock out (or an admin uses /clock force-out).
+# the bottom of the clock channel, last-7-days totals, /clock adjust to fix mistakes and /clock clear
+# to reset everyone's time (it saves a CSV of the old totals first).
 # Data lives in DATA_DIR/clock.json AND is backed up to a hidden #clock-backup channel, so it
 # survives Railway redeploys even without a volume.
 # ----------------------------------------------------------------------
 CLOCK_CHANNEL_NAME = os.getenv("CLOCK_CHANNEL_NAME", "clockin-clockout")
 CLOCK_ROLE_NAMES = {r.strip() for r in os.getenv("CLOCK_ROLE_NAMES", "").split(",") if r.strip()}
+CLOCK_MAX_HOURS = float(os.getenv("CLOCK_MAX_HOURS", "0"))  # auto clock-out after this many hours; 0 = never (default)
 CLOCK_BOARD_MAX_ROWS = int(os.getenv("CLOCK_BOARD_MAX_ROWS", "40"))
 CLOCK_MAX_SESSIONS = int(os.getenv("CLOCK_MAX_SESSIONS", "200"))  # sessions kept per person
 CLOCK_BACKUP_CHANNEL_NAME = os.getenv("CLOCK_BACKUP_CHANNEL_NAME", "clock-backup")
-CLOCK_DEFAULT_TZ = os.getenv("CLOCK_DEFAULT_TZ", "UTC")  # used for anyone who hasn't set /clock timezone
 CLOCK_FILE = os.path.join(DATA_DIR, "clock.json")
 _BACKUP_MARK = "CLOCK_BACKUP_V1"
 
@@ -2340,22 +2325,9 @@ def _live_total(u, now):
     return u["total"] + (max(0, now - u["active"]) if u["active"] is not None else 0)
 
 
-def _week_start(u, now):
-    """Monday 00:00 in this person's timezone (falls back to CLOCK_DEFAULT_TZ, then UTC)."""
-    try:
-        tz = ZoneInfo(u.get("tz") or CLOCK_DEFAULT_TZ)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    dt = datetime.datetime.fromtimestamp(now, tz)
-    monday = (dt - datetime.timedelta(days=dt.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return monday.timestamp()
-
-
 def _week_seconds(u, now):
-    """Time worked this week (resets Monday 00:00 in the person's own timezone)."""
-    window_start = _week_start(u, now)
+    """Time worked in the last 7 days (a rolling window, so it doesn't depend on anyone's timezone)."""
+    window_start = now - 7 * 86400
     total = 0
     for s_, e_ in u["sessions"]:
         total += max(0, min(e_, now) - max(s_, window_start))
@@ -2449,7 +2421,7 @@ def build_board_embed(guild, now=None):
         who = member.mention if member else f"**{r['name']}**"
         rank = medals[i - 1] if i <= 3 else f"`{i}.`"
         dot = " 🟢" if r["active"] else ""
-        lines.append(f"{rank} {who} — **{fmt_duration(r['live'])}** · wk {fmt_duration(r['week'])}{dot}")
+        lines.append(f"{rank} {who} — **{fmt_duration(r['live'])}** · 7d {fmt_duration(r['week'])}{dot}")
     if len(rows) > CLOCK_BOARD_MAX_ROWS:
         lines.append(f"…and {len(rows) - CLOCK_BOARD_MAX_ROWS} more")
     body = "\n".join(lines) if lines else "No time logged yet. Hit **Clock In** to get on the board!"
@@ -2517,7 +2489,7 @@ async def handle_clock_out(interaction: discord.Interaction):
     embed = discord.Embed(
         description=(
             f"🔴 {member.mention} **clocked out** at <t:{int(now)}:t>\n"
-            f"Session **{fmt_duration(duration)}** · Total **{fmt_duration(total)}** · This week **{fmt_duration(week)}**"
+            f"Session **{fmt_duration(duration)}** · Total **{fmt_duration(total)}** · Last 7 days **{fmt_duration(week)}**"
         ),
         color=discord.Color.red(),
     )
@@ -2547,9 +2519,8 @@ async def handle_my_time(interaction: discord.Interaction):
     else:
         embed.add_field(name="Status", value="⚫ Clocked out", inline=False)
     embed.add_field(name="Total", value=fmt_duration(_live_total(u, now)), inline=True)
-    embed.add_field(name="This week", value=fmt_duration(_week_seconds(u, now)), inline=True)
+    embed.add_field(name="Last 7 days", value=fmt_duration(_week_seconds(u, now)), inline=True)
     embed.add_field(name="Sessions", value=str(len(u["sessions"])), inline=True)
-    embed.add_field(name="Timezone", value=u.get("tz") or f"{CLOCK_DEFAULT_TZ} (default)", inline=True)
     if rank:
         embed.set_footer(text=f"Rank #{rank} of {len(rows)} on the board")
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -2688,15 +2659,42 @@ async def clock_restore_missing():
 
 @tasks.loop(seconds=60)
 async def clock_maintenance():
-    # No auto clock-out: this only keeps the board fresh and backs up the data.
     global _clock_tick
     _clock_tick += 1
     try:
+        now = time.time()
+        cap = CLOCK_MAX_HOURS * 3600
         for guild in bot.guilds:
             g = _clock["guilds"].get(str(guild.id))
             if not g:
                 continue
-            if _clock_tick % 5 == 0:
+            auto = []
+            if cap > 0:
+                for uid, u in list(g["users"].items()):
+                    if u["active"] is not None and now - u["active"] > cap:
+                        res = _do_clock_out(guild.id, int(uid), None, now, cap=cap)
+                        if res:
+                            auto.append((uid, res[0]))
+            if auto:
+                _clock_touch(guild.id)
+                ch = _clock_channel(guild)
+                for uid, dur in auto:
+                    if ch:
+                        try:
+                            await ch.send(
+                                embed=discord.Embed(
+                                    description=(
+                                        f"⏰ <@{uid}> was **auto clocked out** after {CLOCK_MAX_HOURS:g}h "
+                                        f"(counted as **{fmt_duration(dur)}**). Forgot to clock out? "
+                                        "An admin can fix the total with `/clock adjust`."
+                                    ),
+                                    color=discord.Color.orange(),
+                                )
+                            )
+                        except discord.HTTPException:
+                            pass
+                schedule_board_repost(guild)
+            elif _clock_tick % 5 == 0:
                 await refresh_board(guild)
         for gid in list(_clock_backup_dirty):
             _clock_backup_dirty.discard(gid)
@@ -2817,8 +2815,7 @@ async def clock_history_cmd(interaction: discord.Interaction, member: discord.Me
     lines = [f"<t:{s}:f> → <t:{e}:t> · **{fmt_duration(e - s)}**" for s, e in u["sessions"][-10:][::-1]]
     embed = discord.Embed(title=f"Time for {member.display_name}", color=discord.Color.blurple())
     embed.add_field(name="Total", value=fmt_duration(_live_total(u, now)), inline=True)
-    embed.add_field(name="This week", value=fmt_duration(_week_seconds(u, now)), inline=True)
-    embed.add_field(name="Timezone", value=u.get("tz") or f"{CLOCK_DEFAULT_TZ} (default)", inline=True)
+    embed.add_field(name="Last 7 days", value=fmt_duration(_week_seconds(u, now)), inline=True)
     if u["active"] is not None:
         embed.add_field(name="Status", value=f"🟢 clocked in since <t:{int(u['active'])}:t>", inline=True)
     embed.add_field(name="Last sessions", value="\n".join(lines) or "None", inline=False)
@@ -2899,41 +2896,173 @@ async def clock_clear_cmd(interaction: discord.Interaction, member: discord.Memb
     )
 
 
-async def _tz_autocomplete(interaction: discord.Interaction, current: str):
-    cur = current.lower().replace(" ", "_")
-    names = [z for z in sorted(available_timezones()) if cur in z.lower()]
-    return [app_commands.Choice(name=n, value=n) for n in names[:25]]
-
-
-@clock_group.command(name="timezone", description="Set your timezone (e.g. America/Los_Angeles)")
-@app_commands.describe(zone="Timezone name", member="Staff only: set it for someone else")
-@app_commands.autocomplete(zone=_tz_autocomplete)
-async def clock_tz_cmd(interaction: discord.Interaction, zone: str, member: discord.Member = None):
-    target = member or interaction.user
-    if target.id != interaction.user.id and not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("You can only set your own timezone.", ephemeral=True)
-        return
-    if not clock_allowed(interaction.user):
-        await interaction.response.send_message("You don't have access to the clock-in system.", ephemeral=True)
-        return
-    try:
-        ZoneInfo(zone)
-    except Exception:
-        await interaction.response.send_message(
-            "Unknown timezone. Start typing and pick one from the list, like `America/New_York`.",
-            ephemeral=True,
-        )
-        return
-    _u(interaction.guild_id, target.id, target.display_name)["tz"] = zone
-    _clock_touch(interaction.guild_id)
-    await interaction.response.send_message(
-        f"Timezone for {target.mention} set to **{zone}**. Their week now runs Monday 00:00 in that zone.",
-        ephemeral=True,
-    )
-    schedule_board_repost(interaction.guild)
-
-
 bot.tree.add_command(clock_group)
+
+
+# ----------------------------------------------------------------------
+# WHITELIST REQUESTS + FEMALE-VERIFICATION NUDGE
+# - "Request WL" button (/wl-panel) or /request-wl gives the whitelist role right away.
+# - Typing "wl"/"whitelist" in a WL-request channel (names in WL_REQUEST_CHANNELS) does the same.
+# - Anyone talking about fwl / female whitelist / female verification anywhere gets a short reply
+#   with a button that opens a Female Verify ticket (staff are never replied to).
+# Note: this gives the role with NO staff approval — keep /apply if you want approvals.
+# ----------------------------------------------------------------------
+WL_REQUEST_CHANNELS = {
+    _norm_name(c)
+    for c in os.getenv("WL_REQUEST_CHANNELS", "wl-request,request-wl,get-wl,whitelist-request,wl-requests").split(",")
+    if _norm_name(c)
+}
+WL_REPLY_COOLDOWN_SECONDS = int(os.getenv("WL_REPLY_COOLDOWN_SECONDS", "60"))
+WL_REPLY_DELETE_SECONDS = int(os.getenv("WL_REPLY_DELETE_SECONDS", "45"))
+_FWL_RE = re.compile(r"\b(fwl|f wl|f whitelist)\b")
+_FEMALE_RE = re.compile(r"\b(female|females|fem|femme)\b")
+_VERIFY_WORDS_RE = re.compile(r"\b(wl|whitelist|whitelisted|white list|verify|verified|verification|verifying)\b")
+_WL_REQUEST_RE = re.compile(r"\b(wl|whitelist|whitelisted|white list)\b")
+_wl_cooldowns = {}
+
+
+def _norm_text(text):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())).strip()
+
+
+def is_female_wl_talk(text):
+    t = _norm_text(text)
+    return bool(_FWL_RE.search(t) or (_FEMALE_RE.search(t) and _VERIFY_WORDS_RE.search(t)))
+
+
+def is_wl_request_text(text):
+    return bool(_WL_REQUEST_RE.search(_norm_text(text)))
+
+
+def _wl_status_text(status, role):
+    if status == "ok":
+        return f"✅ You've been given the **{role.name}** role — welcome in!"
+    if status == "already":
+        return "You already have the whitelist role."
+    if status == "hierarchy":
+        return "I can't give that role right now (it's above mine) — please tell staff."
+    return "I couldn't give you the role — please tell staff."
+
+
+async def grant_wl(member, via):
+    """Gives the whitelist role. Returns (status, role): ok / already / hierarchy / error."""
+    guild = member.guild
+    role = discord.utils.get(guild.roles, name=WHITELIST_ROLE_NAME)
+    if role is None:
+        try:
+            role = await guild.create_role(name=WHITELIST_ROLE_NAME, reason="Auto-created whitelist role")
+        except discord.HTTPException:
+            return "error", None
+    if role in member.roles:
+        return "already", role
+    if role >= guild.me.top_role:
+        return "hierarchy", role
+    try:
+        await member.add_roles(role, reason=f"WL requested ({via})")
+    except discord.HTTPException:
+        return "error", role
+    log_channel = get_server_log_channel(guild)
+    if log_channel:
+        try:
+            embed = discord.Embed(title="✅ WL role given", color=discord.Color.green())
+            embed.add_field(name="Member", value=member.mention, inline=True)
+            embed.add_field(name="How", value=via, inline=True)
+            await log_channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+    return "ok", role
+
+
+async def handle_wl_request(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("Use this in the server.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    status, role = await grant_wl(interaction.user, "button/command")
+    await interaction.followup.send(_wl_status_text(status, role), ephemeral=True)
+
+
+class FemaleTicketView(discord.ui.View):
+    """Attached to the auto-reply so they can open the ticket in one click."""
+
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Open Female Verify Ticket", emoji="💗", style=discord.ButtonStyle.blurple)
+    async def open_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_ticket(interaction, "female_verify")
+
+
+class WLPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Request WL", emoji="✅", style=discord.ButtonStyle.green, custom_id="wl_request_btn")
+    async def request(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_wl_request(interaction)
+
+    @discord.ui.button(label="Female WL (verification)", emoji="💗", style=discord.ButtonStyle.blurple, custom_id="wl_female_btn")
+    async def female(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_ticket(interaction, "female_verify")
+
+
+async def handle_wl_message(message: discord.Message):
+    """Called from on_message. Never raises — a bug here must not break the rest of the bot."""
+    try:
+        member = message.author
+        if is_staff(member):
+            return
+        channel_name = getattr(message.channel, "name", "") or ""
+        norm_channel = _norm_name(channel_name)
+        # leave ticket channels and female/verification channels alone
+        if _ticket_key_from_name(channel_name) in TICKET_TYPES or "female" in norm_channel or "verif" in norm_channel:
+            return
+        female = is_female_wl_talk(message.content)
+        request = (not female) and norm_channel in WL_REQUEST_CHANNELS and is_wl_request_text(message.content)
+        if not (female or request):
+            return
+        guild = message.guild
+        key = (guild.id, member.id)
+        now = time.time()
+        if now - _wl_cooldowns.get(key, 0) < WL_REPLY_COOLDOWN_SECONDS:
+            return
+        _wl_cooldowns[key] = now
+        if female:
+            hub = find_text_channel(guild, "ticket-hub")
+            text = (
+                f"{member.mention} female whitelist needs verification first. "
+                "Click the button below to open a **Female Verify Ticket** and staff will verify you"
+                + (f" (or open one in {hub.mention})." if hub else ".")
+            )
+            await message.reply(text, view=FemaleTicketView(), mention_author=False, delete_after=WL_REPLY_DELETE_SECONDS)
+        else:
+            status, role = await grant_wl(member, f"typed in #{channel_name}")
+            await message.reply(_wl_status_text(status, role), mention_author=False, delete_after=WL_REPLY_DELETE_SECONDS)
+    except Exception as e:
+        print(f"WL message handler error: {e!r}")
+
+
+@bot.tree.command(name="request-wl", description="Get the whitelist role")
+@app_commands.guild_only()
+async def request_wl_cmd(interaction: discord.Interaction):
+    await handle_wl_request(interaction)
+
+
+@bot.tree.command(name="wl-panel", description="Post the Request WL / Female WL buttons in this channel")
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def wl_panel_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Whitelist",
+        description=(
+            f"✅ **Request WL** — click it and you get the **{WHITELIST_ROLE_NAME}** role right away.\n"
+            "💗 **Female WL** — female characters have to be verified first. Click the pink button to open "
+            "a **Female Verify Ticket** with staff."
+        ),
+        color=discord.Color.green(),
+    )
+    await interaction.channel.send(embed=embed, view=WLPanelView())
+    await interaction.response.send_message("Posted.", ephemeral=True)
 
 
 # ----------------------------------------------------------------------
@@ -2964,6 +3093,7 @@ async def on_ready():
     bot.add_view(RulesGateView())
     bot.add_view(SelfRoleView())
     bot.add_view(ClockPanelView())
+    bot.add_view(WLPanelView())
     if not giveaway_checker.is_running():
         giveaway_checker.start()
     await clock_restore_missing()
